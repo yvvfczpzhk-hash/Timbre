@@ -182,7 +182,7 @@ table.t td.n { text-align: right; font-variant-numeric: tabular-nums; }
 <div id="app"><p style="padding:40px 20px;color:#9aa7b5">Chargement…</p></div>
 <noscript><p style="padding:20px">TIMBRE a besoin de JavaScript.</p></noscript>
 <script>
-window.TB = window.TB || {}; TB.VERSION = "1.0 · 2026-09-26";
+window.TB = window.TB || {}; TB.VERSION = "1.1 · 2026-10-01";
 
 /* ==== dsp.js ==== */
 /* ============================================================================
@@ -461,11 +461,13 @@ window.TB = window.TB || {}; TB.VERSION = "1.0 · 2026-09-26";
 
     // plancher de bruit : niveau des trames non périodiques (silence, souffle de la pièce).
     // Sans pause dans la prise, on suppose ≥ 40 dB de dynamique entre voix et bruit.
-    let floorDb = o.floorDb;
+    // noiseDb garde l'estimation brute (avant plafonnement) : c'est elle qui sert au rapport signal/bruit.
+    let floorDb = o.floorDb, noiseDb = NaN;
     const pmax = percentile(db, 0.98);
-    if (!isFinite(floorDb)) {
+    {
       const quiet = []; for (let t = 0; t < nFrames; t++) if (P[t] < 0.5) quiet.push(db[t]);
-      floorDb = quiet.length >= 15 ? percentile(quiet, 0.3) : pmax - 40;
+      if (quiet.length >= 15) noiseDb = percentile(quiet, 0.3);
+      if (!isFinite(floorDb)) floorDb = isFinite(noiseDb) ? noiseDb : pmax - 40;
     }
     floorDb = Math.min(floorDb, pmax - 25);
 
@@ -542,7 +544,7 @@ window.TB = window.TB || {}; TB.VERSION = "1.0 · 2026-09-26";
       midi[q] = f0[q] > 0 ? hzToMidi(f0[q]) : NaN;
       if (!voiced[q]) clarity[q] = P[q];
     }
-    const res = { hop: HOP / FS, fs: FS, n: nFrames, f0, midi, clarity, db, voiced, floorDb, offset: WIN / 2 / FS };
+    const res = { hop: HOP / FS, fs: FS, n: nFrames, f0, midi, clarity, db, voiced, floorDb, noiseDb, offset: WIN / 2 / FS };
     if (o.debug) res.cands = cands;
     return res;
   }
@@ -892,7 +894,8 @@ window.TB = window.TB || {}; TB.VERSION = "1.0 · 2026-09-26";
     let clip = 0; for (let i = 0; i < x.length; i++) if (Math.abs(x[i]) > 0.985) clip++;
     const vdb = []; for (let t = 0; t < track.n; t++) if (track.voiced[t]) vdb.push(track.db[t]);
     const voiceDb = median(vdb);
-    const snr = isFinite(voiceDb) ? voiceDb - track.floorDb : 0;
+    // rapport signal/bruit réel (bruit mesuré dans les silences de la prise) ; inconnu sans silence
+    const snr = isFinite(voiceDb) && isFinite(track.noiseDb) ? voiceDb - track.noiseDb : NaN;
     const voicedRatio = track.n ? vdb.length / track.n : 0;
     return { clipRatio: clip / Math.max(1, x.length), voiceDb, snr, voicedRatio, voicedSec: vdb.length * track.hop };
   }
@@ -911,15 +914,19 @@ window.TB = window.TB || {}; TB.VERSION = "1.0 · 2026-09-26";
     const x0 = fsIn === FS ? Float32Array.from(pcm) : resample(pcm, fsIn, FS);
     const x = highpass(x0, FS, 55);
     const tol = spec.tol || 25;
+    // diapason : les modèles sont joués en La = spec.a4 ; les hauteurs sont mesurées dans ce même repère
+    const tuneOff = isFinite(spec.a4) && spec.a4 > 0 ? 12 * Math.log2(spec.a4 / 440) : 0;
     let expect = null;
     if (spec.targets && spec.targets.length) {
       const ms = spec.targets.map(t => t.midi); expect = { lo: Math.min(...ms), hi: Math.max(...ms) };
     } else if (isFinite(spec.target)) expect = { lo: spec.target, hi: spec.target };
     else if (spec.range) expect = { lo: spec.range[0], hi: spec.range[1] };
+    if (expect && tuneOff) expect = { lo: expect.lo + tuneOff, hi: expect.hi + tuneOff };
 
     if (spec.type === 'hiss') return analyzeHiss(x, spec);
 
     const track = trackPitch(x, { expect, floorDb: spec.floorDb, fmin: spec.fmin, fmax: spec.fmax });
+    if (tuneOff) { for (let t = 0; t < track.n; t++) if (track.voiced[t]) track.midi[t] -= tuneOff; track.tuneOff = tuneOff; }
     const q = recordingQuality(x, track);
     const out = { type: spec.type, track, quality: q, ok: true, issues: [] };
     if (q.clipRatio > 0.004) out.issues.push('clip');
@@ -970,7 +977,7 @@ window.TB = window.TB || {}; TB.VERSION = "1.0 · 2026-09-26";
         const first = segs[0].a, last = segs[segs.length - 1].b;
         const vm = []; for (let t = first; t < last; t++) if (track.voiced[t]) vm.push(track.midi[t]);
         out.center = median(vm);
-        out.f0 = midiToHz(out.center);
+        out.f0 = midiToHz(out.center + tuneOff);
         out.voice = voiceQuality(x, track, first, last, true);
         out.voicedSec = vm.length * track.hop;
         const big = segs.reduce((u, w) => (w.b - w.a > u.b - u.a ? w : u));
@@ -979,27 +986,47 @@ window.TB = window.TB || {}; TB.VERSION = "1.0 · 2026-09-26";
         out.pitch.reliable = true;               // pas de verdict de justesse ici
         return out;
       }
-      const seg = segs.reduce((u, w) => (w.b - w.a > u.b - u.a ? w : u));
+      // « a ! » parlé puis tenu (spec.anchor) : la tenue est le plus long segment ; l'amorce parlée, le segment
+      // court juste avant (ou, sans pause, le début de la tenue)
+      let seg = segs.reduce((u, w) => (w.b - w.a > u.b - u.a ? w : u)), anchor = null;
+      if (spec.anchor) {
+        const iSeg = segs.indexOf(seg), prev = iSeg > 0 ? segs[iSeg - 1] : null, hop = track.hop;
+        if (prev && (prev.b - prev.a) * hop >= 0.15 && (prev.b - prev.a) * hop <= 1.6) anchor = { a: prev.a, b: prev.b, merged: false };
+        else if ((seg.b - seg.a) * hop >= 2.2) {
+          anchor = { a: seg.a + Math.round(0.05 / hop), b: seg.a + Math.round(0.5 / hop), merged: true };
+          seg = { a: seg.a + Math.round(0.8 / hop), b: seg.b };
+        }
+      }
       out.segment = { a: seg.a, b: seg.b, sec: (seg.b - seg.a) * track.hop };
       const m = []; for (let t = seg.a; t < seg.b; t++) if (track.voiced[t]) m.push(track.midi[t]);
       const skip = Math.min(Math.floor(m.length * 0.2), 25);
       const core = m.slice(skip, m.length - Math.floor(m.length * 0.1));
       const center = median(core);
       out.center = center;
+      const seq = [];
+      for (let t = seg.a; t < seg.b; t++) seq.push(track.voiced[t] ? track.midi[t] : NaN);
+      const body = seq.slice(Math.min(skip, seq.length >> 2));
+      out.stability = vibratoStats(body, track.hop);
       if (isFinite(spec.target)) {
         let c = center, oct = 0;
         if (Math.abs(c - spec.target) > 9) { oct = Math.round((c - spec.target) / 12) * 12; }
         out.octave = oct;
         out.err = (c - oct - spec.target) * 100;
-        let inTol = 0; core.forEach(v => { if (Math.abs((v - oct - spec.target) * 100) <= Math.max(tol, 35)) inTol++; });
-        out.inTolRatio = core.length ? inTol / core.length : 0;
+        // la hauteur perçue d'un vibrato est sa moyenne (Shonle & Horan 1980) : la stabilité se juge sur la
+        // courbe débarrassée du vibrato (moyenne glissante sur une période), pas trame par trame
+        const st = out.stability, per = st && st.vibrato && st.rate > 0 ? Math.round(1 / (st.rate * track.hop)) : 1;
+        const trend = per > 2 ? Array.from(movingAvg(core, per)) : core;
+        let inTol = 0; trend.forEach(v => { if (Math.abs((v - oct - spec.target) * 100) <= Math.max(tol, 35)) inTol++; });
+        out.inTolRatio = trend.length ? inTol / trend.length : 0;
         out.success = Math.abs(out.err) <= tol && out.inTolRatio >= 0.6;
         out.score = Math.abs(out.err) <= tol ? 1 : Math.abs(out.err) <= 2 * tol ? 0.5 : 0;
+        // voix très soufflée : une « fausse note » d'un intervalle harmonique simple (quinte, quarte, tierce
+        // majeure, sixte) avec une périodicité faible est une erreur de mesure (harmonique), pas de chant
+        const e = Math.abs(c - oct - spec.target);
+        if (out.pitch.clarity < 0.72 && [3.86, 4.98, 7.02, 8.84].some(r => Math.abs(e - r) < 0.35)) {
+          out.pitch.reliable = false; if (!out.issues.includes('unreliable')) out.issues.push('unreliable');
+        }
       }
-      const seq = [];
-      for (let t = seg.a; t < seg.b; t++) seq.push(track.voiced[t] ? track.midi[t] : NaN);
-      const body = seq.slice(Math.min(skip, seq.length >> 2));
-      out.stability = vibratoStats(body, track.hop);
       if (spec.split && body.length > 60) {
         const h = body.length >> 1;
         out.halves = [vibratoStats(body.slice(0, h), track.hop), vibratoStats(body.slice(h), track.hop)];
@@ -1007,6 +1034,13 @@ window.TB = window.TB || {}; TB.VERSION = "1.0 · 2026-09-26";
       out.voice = voiceQuality(x, track, seg.a, seg.b);
       out.voiceMidi = center;
       out.levelCurve = levelCurve(track, seg.a, seg.b);
+      if (anchor) {
+        // sans l'attaque ni l'extinction du « a ! » (60 ms de chaque côté), moins périodiques que le cœur du son
+        const trim = !anchor.merged && (anchor.b - anchor.a) * track.hop >= 0.3 ? Math.round(0.06 / track.hop) : 0;
+        const a1 = anchor.a + trim, b1 = anchor.b - trim;
+        const am = []; for (let t = a1; t < b1; t++) if (track.voiced[t]) am.push(track.midi[t]);
+        out.anchor = { voice: voiceQuality(x, track, a1, b1), midi: median(am), sec: (anchor.b - anchor.a) * track.hop, merged: anchor.merged };
+      }
     }
     else if (spec.type === 'glide') {
       Object.assign(out, analyzeGlide(track));
@@ -1058,7 +1092,8 @@ window.TB = window.TB || {}; TB.VERSION = "1.0 · 2026-09-26";
     if (b - a > maxF) { const mid = (a + b) >> 1; a = mid - (maxF >> 1); b = a + maxF; }
     const h = h1h2(x, track, a, b), c = cpps(x, track, a, b), br = brilliance(x, track, a, b);
     const dbs = []; for (let t = a; t < b; t++) if (track.voiced[t]) dbs.push(track.db[t]);
-    return { h1h2: h.value, cpps: c.value, brilliance: br.value, level: median(dbs) - track.floorDb, frames: h.n };
+    // levelDb : niveau absolu (dB plein échelle, micro sans gain automatique) — la densité dépend du volume
+    return { h1h2: h.value, cpps: c.value, brilliance: br.value, level: median(dbs) - track.floorDb, levelDb: median(dbs), frames: h.n };
   }
   D.voiceQuality = voiceQuality;
 
@@ -1075,14 +1110,18 @@ window.TB = window.TB || {}; TB.VERSION = "1.0 · 2026-09-26";
     let lo = Infinity, hi = -Infinity;
     for (let t = 0; t < n; t++) if (track.voiced[t] && track.clarity[t] > 0.6) { lo = Math.min(lo, m[t]); hi = Math.max(hi, m[t]); }
     // sauts brusques : entre deux trames voisées proches (trou ≤ 50 ms toléré), écart ≥ 1,2 demi-ton,
-    // confirmé par les médianes de 3 trames avant / après (≥ 1,6 demi-ton, hors erreur d'octave)
+    // confirmé par les médianes de 3 trames avant / 5 trames après (≥ 1,6 demi-ton, hors erreur d'octave).
+    // Les trames faibles (attaque, extinction du son) ne comptent pas : la hauteur y est peu sûre.
     const V = []; for (let t = 0; t < n; t++) if (track.voiced[t]) V.push(t);
-    for (let k = 3; k + 2 < V.length; k++) {
+    const weakAt = t => track.db[t] < track.floorDb + 6;
+    for (let k = 3; k + 4 < V.length; k++) {
       if (V[k] - V[k - 1] > 6) continue;               // vrai trou : traité plus bas (coupure)
       const jump = m[V[k]] - m[V[k - 1]];
       if (Math.abs(jump) < 1.2) continue;
-      const before = [m[V[k - 3]], m[V[k - 2]], m[V[k - 1]]], after = [m[V[k]], m[V[k + 1]], m[V[k + 2]]];
-      if (V[k - 1] - V[k - 3] > 4 || V[k + 2] - V[k] > 4) continue;
+      if (V[k - 1] - V[k - 3] > 4 || V[k + 4] - V[k] > 6) continue;
+      let weak = false; for (let q = k - 3; q <= k + 4; q++) if (weakAt(V[q])) { weak = true; break; }
+      if (weak) continue;
+      const before = [m[V[k - 3]], m[V[k - 2]], m[V[k - 1]]], after = [m[V[k]], m[V[k + 1]], m[V[k + 2]], m[V[k + 3]], m[V[k + 4]]];
       const J = median(after) - median(before), aj = Math.abs(J);
       if (aj >= 1.6 && Math.abs(aj - 12) > 1.2) {
         const t = V[k];
@@ -1376,6 +1415,12 @@ window.TB = window.TB || {}; TB.VERSION = "1.0 · 2026-09-26";
     chroma: [0, 1, 2, 3, 4, 3, 2, 1, 0],
   };
   const span = pat => Math.max(...pat) - Math.min(...pat);
+  /** Étiquette d'un motif dans l'ordre où on le chante : 1re note → note la plus éloignée (« Sol3 → Do3 » pour une descente). */
+  C.patternSpan = function (pattern, root) {
+    const pat = C.PATTERNS[pattern], first = pat[0];
+    const far = pat.reduce((u, w) => (Math.abs(w - first) > Math.abs(u - first) ? w : u), first);
+    return nm(root + first) + (far !== first ? ' → ' + nm(root + far) : '');
+  };
 
   /* Aide-mémoire d'intervalles (début de chansons connues) */
   C.IV_NAMES = { 1: 'seconde mineure', 2: 'seconde majeure', 3: 'tierce mineure', 4: 'tierce majeure', 5: 'quarte', 6: 'triton', 7: 'quinte', 8: 'sixte mineure', 9: 'sixte majeure', 10: 'septième mineure', 11: 'septième majeure', 12: 'octave' };
@@ -1385,6 +1430,12 @@ window.TB = window.TB || {}; TB.VERSION = "1.0 · 2026-09-26";
     3: 'Greensleeves (« A- las »)', 1: 'Les Dents de la mer', 10: 'Star Trek (thème)',
   };
   const IV_COST = { 12: 1.2, 7: 1.5, 2: 2.0, 5: 2.2, 4: 2.4, 3: 2.9, 9: 3.2, 1: 3.5, 8: 3.8, 10: 4.0, 11: 4.5, 6: 4.8 };
+  /** Nom d'intervalle avec article : « la quinte », « le triton », « l’octave » ; « une quinte », « un triton ». */
+  C.ivDef = iv => (iv === 6 ? 'le ' : iv === 12 ? 'l’' : 'la ') + C.IV_NAMES[iv];
+  C.ivIndef = iv => (iv === 6 ? 'un ' : 'une ') + C.IV_NAMES[iv];
+  /** Famille de voyelle d'un exercice (« ya » → a, « goug » → ou…) : la densité se compare à voyelle égale. */
+  const VOWEL_CLASS = { a: 'a', ya: 'a', la: 'a', 'é': 'e', e: 'e', 'hé': 'e', nay: 'e', ou: 'ou', goug: 'ou', mum: 'ou', u: 'ou', wi: 'i', oui: 'i', i: 'i', o: 'o', 'ɔ': 'o', ol: 'o', ng: 'ng', mmm: 'ng', m: 'ng' };
+  C.vowelClass = v => VOWEL_CLASS[String(v || 'a').toLowerCase()] || 'a';
 
   /* ------------------------------------------------------------- utilitaires de jugement */
   function pitchWords(err, tol, target) {
@@ -1416,26 +1467,58 @@ window.TB = window.TB || {}; TB.VERSION = "1.0 · 2026-09-26";
     if (res.issues.includes('silence')) fb.push({ kind: 'warn', text: 'Je ne t’ai pas entendu — rapproche le téléphone (30–50 cm) et chante après le compte.' });
     else if (res.issues.includes('breath')) fb.push({ kind: 'bad', text: 'J’entends surtout de l’air, pas de son vocal : mets plus de voix, comme en parlant fort à quelqu’un.' });
     if (res.issues.includes('clip')) fb.push({ kind: 'warn', text: 'Son saturé : éloigne un peu le téléphone.' });
-    if (res.issues.includes('noise')) fb.push({ kind: 'warn', text: 'Pièce bruyante : la mesure est moins sûre.' });
+    if (res.issues.includes('noise')) fb.push({ kind: 'warn', text: 'Pièce bruyante (ou téléphone trop loin) : la mesure est moins sûre.' });
     if (res.issues.includes('unreliable')) fb.push({ kind: 'bad', text: 'Voix très soufflée : je ne peux pas mesurer la justesse de façon fiable. Donne plus de corps au son (voyelle « parlée »).' });
     return fb;
   }
   C.recordingIssues = recordingIssues;
 
-  /** Indice de densité : comparaison à la référence personnelle de la même zone de hauteur. */
-  C.densityVerdict = function (voice, midi, ctx) {
+  /**
+   * Densité (CPPS) : très sensible au bruit de la pièce et à la distance du micro (−5 à −7 dB entre 40 et 20 dB
+   * de rapport signal/bruit) ; on ne la juge qu'au-dessus de 30 dB, seuil « acceptable » des mesures de qualité
+   * vocale (Deliyski, Shaw & Evans 2005 : recommandé > 42 dB, inacceptable < 30 dB).
+   */
+  C.DENSITY_SNR = 30;
+  /**
+   * Indice de densité : comparaison à ta référence personnelle dans des conditions comparables (même zone de
+   * hauteur, même voyelle, volume et bruit proches). o : {vowel, snr}
+   */
+  C.densityVerdict = function (voice, midi, ctx, o) {
+    o = o || {};
     if (!voice || !isFinite(voice.cpps)) return null;
-    const ref = ctx.densityRef ? ctx.densityRef(midi) : null;
+    if (isFinite(o.snr) && o.snr < C.DENSITY_SNR) return { level: null, noisy: true, cpps: voice.cpps, text: 'Densité non jugée : pièce trop bruyante ou téléphone trop loin.' };
+    const ref = ctx.densityRef ? ctx.densityRef(midi, { vowel: o.vowel, levelDb: voice.levelDb, snr: o.snr }) : null;
     if (!ref) return { level: null, cpps: voice.cpps, text: 'Densité : référence en construction (' + f1(voice.cpps) + ' dB)' };
     const d = voice.cpps - ref.cpps;
-    if (d >= -1.5) return { level: 'dense', delta: d, cpps: voice.cpps, text: 'Son dense et timbré ✓' };
-    if (d >= -4) return { level: 'air', delta: d, cpps: voice.cpps, text: 'Un peu d’air dans le son (' + f1(d) + ' dB sous ta référence)' };
-    return { level: 'souffle', delta: d, cpps: voice.cpps, text: 'Son soufflé (' + f1(d) + ' dB sous ta référence)' };
+    // la densité mesurée monte avec le volume (Brockmann-Bauser et al. 2021) : on le dit quand il a beaucoup changé
+    const dL = isFinite(voice.levelDb) && isFinite(ref.levelDb) ? voice.levelDb - ref.levelDb : 0;
+    const out = { delta: d, cpps: voice.cpps, louder: dL > 6, softer: dL < -6 };
+    // son serré : beaucoup plus de fermeture (H1–H2 bas) que d'habitude, et plus fort : on pousse
+    out.pressed = isFinite(voice.h1h2) && isFinite(ref.h1h2) && voice.h1h2 < ref.h1h2 - 6 && dL > 3;
+    if (d >= -1.5) return Object.assign(out, { level: 'dense', text: 'Son dense et timbré ✓' + (out.louder ? ' (plus fort que d’habitude)' : '') });
+    const why = out.softer ? ' — tu chantes aussi plus doucement que d’habitude' : '';
+    if (d >= -4) return Object.assign(out, { level: 'air', text: 'Un peu d’air dans le son (' + f1(d) + ' dB sous ta référence)' + why });
+    return Object.assign(out, { level: 'souffle', text: 'Son soufflé (' + f1(d) + ' dB sous ta référence)' + why });
   };
+  /** Conseil quand le son est serré (densité obtenue en poussant) : risque pour la voix. */
+  C.PRESSED_TIP = 'Son peut-être serré : garde le timbre sans pousser — un peu moins de volume, la même voyelle « parlée ».';
+  /** Ajoute le verdict de densité aux retours ; renvoie le verdict. */
+  function densityFb(fb, dv, tip) {
+    if (!dv) return null;
+    fb.push({ kind: dv.level === 'dense' ? 'good' : dv.level ? 'warn' : 'info', text: dv.text });
+    if (dv.pressed) fb.push({ kind: 'tip', text: C.PRESSED_TIP });
+    else if (dv.level === 'souffle' && tip) fb.push({ kind: 'tip', text: tip });
+    return dv;
+  }
+  /** Vibrato très large (> ±90 c) : perçu comme une note qui ondule. */
+  function wideVibratoFb(res) {
+    const st = res && res.stability;
+    return st && st.vibrato && st.extent > 90 ? { kind: 'tip', text: 'Vibrato très large (±' + Math.round(st.extent) + ' c) : moins d’amplitude, plus de soutien régulier.' } : null;
+  }
 
   /* Étapes génériques */
   const listenNote = (midi, dur, o) => Object.assign({ t: 'listen', play: { kind: 'note', midi, dur: dur || 2 }, label: 'Écoute la cible' }, o || {});
-  const listenSeq = (notes, tempo, o) => Object.assign({ t: 'listen', play: { kind: 'seq', notes, tempo }, label: 'Écoute le modèle' }, o || {});
+  const listenSeq = (notes, tempo, o, play) => Object.assign({ t: 'listen', play: Object.assign({ kind: 'seq', notes, tempo }, play || {}), label: 'Écoute le modèle' }, o || {});
   const singStep = (sec, spec, o) => Object.assign({ t: 'sing', rec: { sec, spec }, countIn: 0, label: 'À toi' }, o || {});
 
   /** Note la plus haute que demande un jeu de paramètres. */
@@ -1507,6 +1590,7 @@ window.TB = window.TB || {}; TB.VERSION = "1.0 · 2026-09-26";
       const of = octaveFb(res.octave, false); if (of) fb.push(of);
       if (!w.ok) fb.push({ kind: 'tip', text: w.far ? 'Réécoute la cible et fredonne-la bouche fermée avant de chanter : trouve-la d’abord, puis ouvre.' : w.dir === 'bas' ? CUE_LOW : CUE_HIGH });
       if (res.stability && !res.stability.vibrato && res.stability.wobble > 25) fb.push({ kind: 'tip', text: 'La note ondule : appuie le son sur un souffle régulier, comme un « ssss » bien tenu.' });
+      const wv = wideVibratoFb(res); if (wv) fb.push(wv);
       return { y, success: y === 1, fb, metrics: { err: res.err, inTol: inT } };
     },
   });
@@ -1567,9 +1651,15 @@ window.TB = window.TB || {}; TB.VERSION = "1.0 · 2026-09-26";
     // « Réussi » : presque tout juste, aucune note oubliée ni nettement fausse
     let success = res.score >= 0.8 && res.missed === 0 && clearlyOff === 0;
     const offOctave = o.strictOctave && res.octave;
-    if (offOctave) { y = 0; success = false; }
-    fb.push({ kind: success ? 'good' : 'bad', text: good + '/' + n + ' notes justes' });
-    const of = octaveFb(res.octave, o.strictOctave); if (of) fb.push(of);
+    if (offOctave) {
+      // la mélodie est juste mais pas à la bonne octave : dans un exercice de registre, c'est la hauteur qui compte
+      y = 0; success = false;
+      fb.push({ kind: 'bad', text: 'Bonne mélodie (' + good + '/' + n + ' à l’octave près), mais chantée une octave ' + (res.octave < 0 ? 'plus bas' : 'plus haut') + ' que le modèle.' });
+      fb.push({ kind: 'tip', text: 'Ici le but est de chanter à la hauteur du modèle (c’est elle qui travaille le registre), quitte à alléger le son.' });
+    } else {
+      fb.push({ kind: success ? 'good' : 'bad', text: good + '/' + n + ' notes justes' });
+      const of = octaveFb(res.octave, o.strictOctave); if (of) fb.push(of);
+    }
     const wrong = res.notes.find(x => x.wrong && isFinite(x.center));
     if (wrong) fb.push({ kind: 'bad', text: 'Note ' + (wrong.i + 1) + ' : tu as chanté ' + D.noteName(Math.round(wrong.center + (res.octave || 0))) + ' au lieu de ' + D.noteName(wrong.target) + '.' });
     else if (res.missed) fb.push({ kind: 'bad', text: res.missed + ' note(s) non chantée(s) ou trop courte(s).' });
@@ -1598,7 +1688,7 @@ window.TB = window.TB || {}; TB.VERSION = "1.0 · 2026-09-26";
       if (p.distract) for (let i = 0; i < 3; i++) para.push(p.note + pick(r, [-5, -4, -3, 2, 3, 4, 6, 8]));
       return [
         listenNote(p.note, 1.6),
-        p.distract ? { t: 'listen', play: { kind: 'seq', notes: para, tempo: 100, timbre: 'piano', pre: Math.max(0, p.delay - 2) }, label: 'Notes parasites — ne te laisse pas embarquer' }
+        p.distract ? { t: 'listen', play: { kind: 'seq', notes: para, tempo: 100, timbre: 'piano', pre: Math.max(0, p.delay - 2) }, label: 'Notes parasites (ce n’est pas la cible) — garde ta note en tête', noReplay: true }
           : { t: 'wait', sec: p.delay, label: 'Silence — garde la note' },
         singStep(4, { type: 'sustain', target: p.note, tol: p.tol }, { label: 'Chante-la de mémoire', hold: 2.5 }),
       ];
@@ -1638,7 +1728,7 @@ window.TB = window.TB || {}; TB.VERSION = "1.0 · 2026-09-26";
       return [
         listenNote(p.root, 1.4, { label: 'Note de départ' }),
         singStep(4.5, { type: 'notes', targets: [{ midi: p.root, dur: 1 }, { midi: p.root + p.dir * p.iv, dur: 1.2 }], tol: p.tol },
-          { label: 'Chante la note, puis la ' + C.IV_NAMES[p.iv] + (p.dir > 0 ? ' au-dessus' : ' en dessous') + hint }),
+          { label: 'Chante la note, puis ' + C.ivDef(p.iv) + (p.dir > 0 ? ' au-dessus' : ' en dessous') + hint }),
       ];
     },
     judge(res, p, ctx) {
@@ -1656,7 +1746,7 @@ window.TB = window.TB || {}; TB.VERSION = "1.0 · 2026-09-26";
       if (a <= p.tol) text = 'Intervalle juste (' + (Math.round(a) === 0 ? '' : ivErr > 0 ? '+' : '−') + Math.round(a) + ' c)';
       else if (a >= 70) {
         const sungIv = p.iv + Math.round(width / 100);
-        text = sungIv >= 1 && sungIv <= 12 && sungIv !== p.iv ? 'Pas le bon intervalle : une ' + C.IV_NAMES[sungIv] + ' au lieu d’une ' + C.IV_NAMES[p.iv] : 'Pas le bon intervalle (' + Math.round(a / 100) + ' demi-ton(s) d’écart)';
+        text = sungIv >= 1 && sungIv <= 12 && sungIv !== p.iv ? 'Pas le bon intervalle : ' + C.ivIndef(sungIv) + ' au lieu d’' + C.ivIndef(p.iv) : 'Pas le bon intervalle (' + Math.round(a / 100) + ' demi-ton(s) d’écart)';
       } else text = 'Intervalle un peu trop ' + (width > 0 ? 'grand' : 'petit') + ' (' + (width > 0 ? '+' : '−') + Math.round(a) + ' c)';
       const y = a <= p.tol ? 1 : a <= 2 * p.tol ? 0.5 : 0;
       fb.push({ kind: y === 1 ? 'good' : 'bad', text });
@@ -1665,23 +1755,61 @@ window.TB = window.TB || {}; TB.VERSION = "1.0 · 2026-09-26";
     },
   });
 
+  /*
+   * Oreille fine : estimation bayésienne adaptative du seuil (ZEST, King-Smith et al. 1994).
+   * Tâche : le 2e son est-il plus haut ou plus bas ? (hasard = 50 %). Fonction psychométrique de Weibull :
+   * P(juste | Δ) = 0,5 + (0,5 − λ)·(1 − exp(−(Δ/θ)^β)), β = 2, λ = 3 % d'inattention. Chaque essai est placé
+   * au seuil le plus probable (≈ 80 % de réussite) ; le seuil rapporté est l'écart donnant 75 % de bonnes
+   * réponses, avec son intervalle de confiance. Plus précis qu'un escalier 2-bas/1-haut de 12 essais.
+   */
+  const ZP = { beta: 2, lapse: 0.03, lo: Math.log(2), hi: Math.log(400), n: 161 };
+  const zPc = (delta, lnTheta) => 0.5 + (0.5 - ZP.lapse) * (1 - Math.exp(-Math.pow(delta / Math.exp(lnTheta), ZP.beta)));
+  const Z75 = Math.pow(-Math.log(1 - 0.25 / (0.5 - ZP.lapse)), 1 / ZP.beta);     // seuil 75 % = θ × Z75
+  C.zest = {
+    /** prior : seuil attendu (cents) ; sd : incertitude (écart-type du logarithme naturel) */
+    init(prior, sd) {
+      const grid = [], post = [];
+      for (let i = 0; i < ZP.n; i++) { const l = ZP.lo + (ZP.hi - ZP.lo) * i / (ZP.n - 1); grid.push(l); post.push(Math.exp(-0.5 * Math.pow((l - Math.log(prior)) / (sd || 0.8), 2))); }
+      const st = { grid, post, n: 0, correct: 0 }; C.zest.norm(st); return st;
+    },
+    norm(st) { const z = st.post.reduce((a, b) => a + b, 0) || 1; for (let i = 0; i < st.post.length; i++) st.post[i] /= z; },
+    /** prochain écart (cents) : moyenne a posteriori du seuil θ */
+    next(st) { let m = 0; for (let i = 0; i < st.grid.length; i++) m += st.post[i] * st.grid[i]; return Math.max(3, Math.min(300, Math.exp(m))); },
+    update(st, delta, ok) {
+      for (let i = 0; i < st.grid.length; i++) { const p = zPc(delta, st.grid[i]); st.post[i] *= ok ? p : 1 - p; }
+      C.zest.norm(st); st.n++; if (ok) st.correct++;
+    },
+    /** seuil à 75 % (cents) et intervalle à 80 % */
+    estimate(st) {
+      let m = 0, c = 0, q10 = null, q90 = null;
+      for (let i = 0; i < st.grid.length; i++) { m += st.post[i] * st.grid[i]; c += st.post[i]; if (q10 == null && c >= 0.1) q10 = st.grid[i]; if (q90 == null && c >= 0.9) q90 = st.grid[i]; }
+      return { threshold: Math.exp(m) * Z75, lo80: Math.exp(q10) * Z75, hi80: Math.exp(q90) * Z75, n: st.n, correct: st.correct };
+    },
+  };
+
   EX.push({
     id: 'discri', name: 'Oreille fine', comp: 'oreille', also: {}, kind: 'quiz', load: 0, pillar: 'justesse',
     why: 'Mesure et affine ton seuil de discrimination : entendre qu’une note est 10 ou 15 cents trop basse, c’est ce qui permet de se corriger en chantant.',
-    how: ['Deux sons se suivent.', 'Le 2e est-il plus haut ou plus bas ?', 'La différence se réduit quand tu réussis (méthode de l’escalier).'],
+    how: ['Deux sons se suivent.', 'Le 2e est-il plus haut ou plus bas ?', 'L’écart s’ajuste à chaque réponse pour trouver ton seuil (environ 4 essais sur 5 réussis).'],
     cue: 'Écoute sans chercher : la première impression est souvent la bonne.',
     candidates(ctx) {
-      const out = []; for (const cents of [100, 70, 50, 35, 25, 18, 12, 8, 6]) out.push({ cents, note: ctx.profile.comfortLow + 7, trials: 12 });
+      const out = []; for (const cents of [100, 70, 50, 35, 25, 18, 12, 8, 6]) out.push({ cents, note: ctx.profile.comfortLow + 7, trials: 24 });
       return out;
     },
     difficulty: p => M.scale(p.cents, M.SCALES.jnd),
-    label: p => 'départ à ' + p.cents + ' cents · ' + p.trials + ' essais',
+    label: p => 'seuil attendu ≈ ' + p.cents + ' cents · ' + p.trials + ' essais',
     steps: p => [{ t: 'quiz', quiz: 'discri', start: p.cents, note: p.note, trials: p.trials }],
-    judge(res) {
+    judge(res, p) {
       if (!res || !isFinite(res.threshold)) return { y: null, success: null, fb: [] };
       const lvl = M.scale(res.threshold, M.SCALES.jnd);
-      return { y: res.pc, success: res.pc >= 0.75, observe: { comp: 'oreille', level: lvl, noise: 1.3 },
-        fb: [{ kind: 'good', text: 'Ton seuil du jour : ≈ ' + Math.round(res.threshold) + ' cents (' + res.correct + '/' + res.n + ' réponses justes).' },
+      // la précision de la mesure (intervalle a posteriori) règle son poids dans ton niveau d'oreille
+      const spread = isFinite(res.lo80) && isFinite(res.hi80) ? Math.abs(M.scale(res.lo80, M.SCALES.jnd) - M.scale(res.hi80, M.SCALES.jnd)) / 2.56 : 1.3;
+      const noise = Math.max(0.6, Math.min(2, spread));
+      const range = isFinite(res.lo80) ? ' (entre ' + Math.round(res.lo80) + ' et ' + Math.round(res.hi80) + ' c)' : '';
+      // une mesure, pas une réussite : y = null ; « réussi » = au moins aussi fin que le seuil attendu
+      return { y: null, success: res.threshold <= ((p && p.cents) || Infinity), observe: { comp: 'oreille', level: lvl, noise },
+        metrics: { jnd: res.threshold },
+        fb: [{ kind: 'good', text: 'Ton seuil du jour : ≈ ' + Math.round(res.threshold) + ' cents' + range + ' · ' + res.correct + '/' + res.n + ' réponses justes.' },
           { kind: 'tip', text: res.threshold <= 12 ? 'Oreille très fine : l’objectif est maintenant de t’entendre aussi bien en chantant.' : 'Repère entre 10 et 25 cents : c’est l’écart que le public entend comme « un peu faux ».' }] };
     },
   });
@@ -1724,7 +1852,7 @@ window.TB = window.TB || {}; TB.VERSION = "1.0 · 2026-09-26";
 
   EX.push({
     id: 'vfe', name: 'Fonction vocale (Stemple)', comp: 'souffle', also: { densite: 0.4, passage: 0.2 }, kind: 'sing', load: 1.3, pillar: 'son',
-    why: 'Le protocole d’exercices de fonction vocale (VFE, Stemple) : tenues maximales douces et glissés, deux fois par semaine. C’est l’un des programmes vocaux les mieux étayés (revue systématique 2019) — tu le connais de VOIX, tes tenues sur « i » servent de point de comparaison.',
+    why: 'Le protocole d’exercices de fonction vocale (VFE, Stemple) : tenues maximales douces et glissés. C’est l’un des programmes vocaux les mieux étayés (revue systématique 2019) ; dans les études, il se fait deux fois par jour pendant six semaines — ici il revient régulièrement dans tes séances, à dose plus légère. Tu le connais de VOIX : tes tenues sur « i » servent de point de comparaison.',
     how: ['1 — « i » tenu le plus longtemps possible, doux mais pas soufflé.', '2 — glissé du grave à l’aigu sur « ol », 3 — de l’aigu au grave.', '4 — cinq tenues maximales Do-Ré-Mi-Fa-Sol sur « ol », lèvres arrondies.'],
     cue: 'Le son le plus doux possible… qui reste une vraie voix, jamais de l’air.',
     candidates: ctx => [{ base: ctx.profile.comfortLow }],
@@ -1733,8 +1861,8 @@ window.TB = window.TB || {}; TB.VERSION = "1.0 · 2026-09-26";
     steps(p) {
       const f = p.base + 5, notes = [0, 2, 4, 5, 7].map(x => p.base + x);
       const out = [listenNote(f, 1.6, { label: '1 — la note de la tenue sur « i »' }), singStep(40, { type: 'mpt' }, { label: '« i » le plus longtemps possible', stopOnSilence: true, timer: 0 }),
-        { t: 'listen', play: { kind: 'glide', from: p.base - 3, to: p.base + 19, dur: 5 }, label: '2 — glissé montant' }, singStep(8, { type: 'glide' }, { label: '« ol » du grave à l’aigu' }),
-        { t: 'listen', play: { kind: 'glide', from: p.base + 19, to: p.base - 3, dur: 5 }, label: '3 — glissé descendant' }, singStep(8, { type: 'glide' }, { label: '« ol » de l’aigu au grave' })];
+        { t: 'listen', play: { kind: 'glide', from: p.base - 3, to: p.base + 19, dur: 4, oneWay: true, vowel: 'o' }, label: '2 — glissé montant' }, singStep(8, { type: 'glide' }, { label: '« ol » du grave à l’aigu' }),
+        { t: 'listen', play: { kind: 'glide', from: p.base + 19, to: p.base - 3, dur: 4, oneWay: true, vowel: 'o' }, label: '3 — glissé descendant' }, singStep(8, { type: 'glide' }, { label: '« ol » de l’aigu au grave' })];
       notes.forEach((m, i) => { out.push(listenNote(m, 1.4, { label: '4 — tenue ' + (i + 1) + '/5' })); out.push(singStep(40, { type: 'mpt' }, { label: '« ol » tenu, doux et timbré', stopOnSilence: true, timer: 0 })); });
       return out;
     },
@@ -1767,7 +1895,7 @@ window.TB = window.TB || {}; TB.VERSION = "1.0 · 2026-09-26";
     label: p => '« ' + p.vowel + ' » × 5 sur ' + nm(p.note) + (p.dyn === 'p' ? ' · piano' : ''),
     steps(p) {
       const notes = [p.note, p.note, p.note, p.note, p.note];
-      return [listenSeq(notes, 60, { label: 'Le modèle : 5 attaques' }),
+      return [listenSeq(notes, 60, { label: 'Le modèle : 5 attaques' }, { detached: true }),
         singStep(7.5, { type: 'notes', targets: notes.map(m => ({ midi: m, dur: 0.6 })), tol: 30, onsets: true }, { countIn: 2, tempo: 60, label: '5 « ' + p.vowel + ' » nets' + (p.dyn === 'p' ? ', doux mais pleins' : '') })];
     },
     judge(res, p) {
@@ -1785,8 +1913,8 @@ window.TB = window.TB || {}; TB.VERSION = "1.0 · 2026-09-26";
 
   EX.push({
     id: 'parle-chante', name: 'Du parlé au chanté', comp: 'densite', also: { poitrine: 0.4 }, kind: 'sing', load: 0.8, pillar: 'son',
-    why: 'Ta voix parlée est dense et timbrée. On la mesure, puis on transporte exactement ce son dans le chant, note après note — c’est le remède direct à la voix qui « part dans l’air ».',
-    how: ['Dis la phrase à voix haute, naturellement, comme à quelqu’un à 3 mètres.', 'Puis chante « a » sur la note, avec le même son qu’en parlant.', 'Mezzo-forte : surtout pas doux.'],
+    why: 'Ta voix parlée est dense et timbrée. Tu dis « a ! » sur la note, comme une exclamation, puis tu le tiens en chantant : on compare les deux sons à même voyelle, même hauteur et même volume — la seule différence qui reste, c’est l’air perdu. C’est le remède direct à la voix qui « part dans l’air ».',
+    how: ['Écoute la note.', 'Dis « a ! » parlé sur cette note, comme pour interpeller quelqu’un (sans crier), puis une petite pause.', 'Chante « aaa » tenu avec exactement le même son et la même énergie.'],
     cue: 'Parle-chante vers quelqu’un en face de toi, comme pour l’appeler sans crier.',
     candidates(ctx) {
       const out = [], sp = ctx.profile.speech || 50;
@@ -1794,31 +1922,39 @@ window.TB = window.TB || {}; TB.VERSION = "1.0 · 2026-09-26";
       return out;
     },
     difficulty: (p, ctx) => 1.5 + 0.15 * Math.max(0, p.note - (ctx.profile.speech || 50)) + 1.2 * rc(p.note, ctx),
-    label: p => 'parole → « a » sur ' + nm(p.note),
+    label: p => '« a ! » parlé → chanté sur ' + nm(p.note),
     steps: p => [
-      { t: 'say', rec: { sec: 4, spec: { type: 'speech' } }, label: 'Dis : « Je t’appelle, tu m’entends ? » — voix naturelle', text: 'Je t’appelle, tu m’entends ?' },
       listenNote(p.note, 1.6),
-      singStep(5, { type: 'sustain', target: p.note, tol: 30 }, { label: 'Même son qu’en parlant, sur « a »', hold: 3.5 }),
+      singStep(6.5, { type: 'sustain', target: p.note, tol: 30, anchor: true }, { label: '« a ! » parlé sur la note… pause… puis tiens-le chanté, même son', hold: 5 }),
     ],
-    judge(res, p, ctx, pre) {
+    judge(res, p, ctx) {
       const fb = recordingIssues(res);
       if (!res.ok || !res.voice) return { y: null, success: null, fb };
-      const sp = pre && pre[0] && pre[0].voice;
-      const v = res.voice;
-      let y = null;
-      if (sp && isFinite(sp.h1h2) && isFinite(v.h1h2)) {
-        const dH = v.h1h2 - sp.h1h2, dC = v.cpps - sp.cpps;
-        y = dH <= 3 && dC >= -3 ? 1 : dH <= 6 && dC >= -6 ? 0.5 : 0;
-        fb.push({ kind: y === 1 ? 'good' : y === 0.5 ? 'warn' : 'bad', text: y === 1 ? 'Même densité qu’en parlant ✓' : y === 0.5 ? 'Presque : un peu plus d’air qu’en parlant' : 'Plus soufflé qu’en parlant' });
-        if (y < 1) fb.push({ kind: 'tip', text: 'Dis d’abord la voyelle sur la note (« a ! » parlé), puis prolonge-la sans rien changer.' });
+      const v = res.voice, an = res.anchor && res.anchor.voice, snr = res.quality && res.quality.snr;
+      let y = null, gap = null;
+      if (isFinite(snr) && snr < C.DENSITY_SNR) fb.push({ kind: 'warn', text: 'Densité non jugée : pièce trop bruyante ou téléphone trop loin.' });
+      else if (an && isFinite(an.cpps) && isFinite(v.cpps)) {
+        // même voyelle, même hauteur : l'écart de densité (CPPS) et de fermeture (H1–H2) entre le parlé et le chanté
+        const dC = v.cpps - an.cpps, dH = isFinite(v.h1h2) && isFinite(an.h1h2) ? v.h1h2 - an.h1h2 : 0;
+        const dL = isFinite(v.levelDb) && isFinite(an.levelDb) ? v.levelDb - an.levelDb : 0;
+        gap = dC;
+        const lvl = Math.min(dC >= -2 ? 2 : dC >= -4 ? 1 : 0, dH <= 3 ? 2 : dH <= 6 ? 1 : 0);
+        y = lvl === 2 ? 1 : lvl === 1 ? 0.5 : 0;
+        fb.push({ kind: y === 1 ? 'good' : y === 0.5 ? 'warn' : 'bad', text: y === 1 ? 'Même densité qu’au « a ! » parlé ✓' : y === 0.5 ? 'Presque : un peu plus d’air qu’au « a ! » parlé' : 'Plus soufflé qu’au « a ! » parlé' });
+        if (dL < -6) fb.push({ kind: 'tip', text: 'Ta tenue est nettement moins forte que ton « a ! » parlé (' + Math.round(dL) + ' dB) : garde la même énergie, c’est elle qui garde le son dense.' });
+        else if (y < 1) fb.push({ kind: 'tip', text: 'Ne change rien entre le « a ! » et la tenue : même bouche, même énergie, juste plus long.' });
+        if (dH < -6) fb.push({ kind: 'tip', text: C.PRESSED_TIP });
+        if (res.anchor.merged) fb.push({ kind: 'info', text: 'Fais une petite pause entre le « a ! » parlé et la tenue : la comparaison sera plus nette.' });
+        else if (isFinite(res.anchor.midi) && isFinite(res.center) && Math.abs(res.anchor.midi - res.center) > 3) fb.push({ kind: 'info', text: 'Dis le « a ! » sur la note de la tenue (il était à ' + Math.round(Math.abs(res.anchor.midi - res.center)) + ' demi-tons) : la comparaison sera plus juste.' });
       } else {
-        const dv = C.densityVerdict(v, p.note, ctx);
-        if (dv) { fb.push({ kind: dv.level === 'dense' ? 'good' : 'warn', text: dv.text }); if (dv.level) y = dv.level === 'dense' ? 1 : dv.level === 'air' ? 0.5 : 0; }
+        fb.push({ kind: 'info', text: 'Je n’ai pas entendu de « a ! » parlé avant la tenue : dis « a ! », petite pause, puis tiens.' });
+        const dv = densityFb(fb, C.densityVerdict(v, p.note, ctx, { vowel: 'a', snr }));
+        if (dv && dv.level) y = dv.level === 'dense' ? 1 : dv.level === 'air' ? 0.5 : 0;
       }
       const of = octaveFb(res.octave, true);
       if (of) { fb.push(of); if (y != null) y = 0; }
       if (isFinite(res.err) && Math.abs(res.err) > 30 && !res.octave) fb.push({ kind: 'tip', text: pitchWords(res.err, 30).text + ' — la hauteur compte moins ici que le son.' });
-      return { y, success: y == null ? null : y === 1, fb, metrics: { h1h2: v.h1h2, cpps: v.cpps, speechH1h2: sp && sp.h1h2, speechCpps: sp && sp.cpps }, ref: sp };
+      return { y, success: y == null ? null : y === 1, fb, metrics: { h1h2: v.h1h2, cpps: v.cpps, anchorCpps: an && an.cpps, anchorH1h2: an && an.h1h2, gap } };
     },
   });
 
@@ -1833,7 +1969,7 @@ window.TB = window.TB || {}; TB.VERSION = "1.0 · 2026-09-26";
     },
     difficulty: (p, ctx) => 2.2 + 0.9 * rc(p.note, ctx) + 0.2 * (p.dur - 6),
     label: p => nm(p.note) + ' · ' + p.dur + ' s',
-    steps: p => [listenNote(p.note, 1.8), singStep(p.dur + 1.5, { type: 'sustain', target: p.note, tol: 30 }, { label: 'Doux → fort → doux, même note', hold: p.dur, swell: true })],
+    steps: p => [{ t: 'listen', play: { kind: 'note', midi: p.note, dur: 4, swell: true }, label: 'Écoute : doux → fort → doux, même note' }, singStep(p.dur + 1.5, { type: 'sustain', target: p.note, tol: 30 }, { label: 'Doux → fort → doux, même note', hold: p.dur, swell: true })],
     judge(res, p, ctx) {
       const fb = recordingIssues(res);
       if (!res.ok || !res.levelCurve || res.success === null) return { y: null, success: null, fb };
@@ -1866,7 +2002,7 @@ window.TB = window.TB || {}; TB.VERSION = "1.0 · 2026-09-26";
         }
         return out;
       },
-      label: p => '« ' + p.vowel + ' » · ' + nm(p.root) + ' → ' + nm(p.root + Math.max(...C.PATTERNS[p.pattern])) + ' · ♩=' + p.tempo,
+      label: p => '« ' + p.vowel + ' » · ' + C.patternSpan(p.pattern, p.root) + ' · ♩=' + p.tempo,
       steps(p) {
         const notes = C.PATTERNS[p.pattern].map(x => p.root + x), beat = 60 / p.tempo;
         return [listenSeq(notes, p.tempo, { vowel: p.vowel }), singStep(notes.length * beat + 2.2, { type: 'notes', targets: notes.map(m => ({ midi: m, dur: beat })), tol: p.tol, voice: true }, { countIn: 2, tempo: p.tempo, label: o.singLabel })];
@@ -1875,12 +2011,9 @@ window.TB = window.TB || {}; TB.VERSION = "1.0 · 2026-09-26";
         const out = judgeNotes(res, p, ctx, null, { strictOctave: true });
         if (out.y == null) return out;
         if (o.density && res.voice && !res.octave) {
-          const top = p.root + Math.max(...C.PATTERNS[p.pattern]);
-          const dv = C.densityVerdict(res.voice, top, ctx);
-          if (dv) {
-            out.fb.push({ kind: dv.level === 'dense' ? 'good' : dv.level ? 'warn' : 'info', text: dv.text });
-            if (dv.level === 'souffle') { out.y = Math.min(out.y, 0.5); out.success = false; out.fb.push({ kind: 'tip', text: o.densityTip || 'Parle davantage la voyelle : plus proche, plus « bavard ».' }); }
-          }
+          const mid = isFinite(res.voiceMidi) ? res.voiceMidi : p.root + Math.max(...C.PATTERNS[p.pattern]);
+          const dv = densityFb(out.fb, C.densityVerdict(res.voice, mid, ctx, { vowel: C.vowelClass(p.vowel), snr: res.quality && res.quality.snr }), o.densityTip || 'Parle davantage la voyelle : plus proche, plus « bavard ».');
+          if (dv && dv.level === 'souffle') { out.y = Math.min(out.y, 0.5); out.success = false; }
         }
         return out;
       },
@@ -1993,8 +2126,9 @@ window.TB = window.TB || {}; TB.VERSION = "1.0 · 2026-09-26";
       fb.push({ kind: w.ok ? 'good' : 'bad', text: w.text });
       const of = octaveFb(res.octave, true);
       if (of) { fb.push(of); return { y: 0, success: false, fb, metrics: { err: res.err, octave: res.octave } }; }
-      const dv = C.densityVerdict(res.voice, p.note, ctx);
-      if (dv) { fb.push({ kind: dv.level === 'dense' ? 'good' : dv.level ? 'warn' : 'info', text: dv.text }); if (dv.level === 'souffle') y = Math.min(y, 0.5); }
+      const dv = densityFb(fb, C.densityVerdict(res.voice, p.note, ctx, { vowel: 'o', snr: res.quality && res.quality.snr }));
+      if (dv && dv.level === 'souffle') y = Math.min(y, 0.5);
+      const wv = wideVibratoFb(res); if (wv) fb.push(wv);
       return { y, success: y === 1, fb, metrics: { err: res.err } };
     },
   });
@@ -2017,6 +2151,7 @@ window.TB = window.TB || {}; TB.VERSION = "1.0 · 2026-09-26";
       const y = w.ok && res.inTolRatio >= 0.6 ? 1 : Math.abs(res.err) <= 2 * p.tol ? 0.5 : 0;
       fb.push({ kind: w.ok ? 'good' : 'bad', text: w.text });
       if (!w.ok && !w.far && w.dir === 'bas') fb.push({ kind: 'tip', text: 'En aigu, le son bas vient souvent d’un manque d’énergie : plus de brillance (« twang »), pas plus de force.' });
+      const wv = wideVibratoFb(res); if (wv) fb.push(wv);
       return { y, success: y === 1, fb, metrics: { err: res.err } };
     },
   });
@@ -2039,7 +2174,7 @@ window.TB = window.TB || {}; TB.VERSION = "1.0 · 2026-09-26";
       const pl = { p5: 1.2, tierces: 2.4, melisme: 2.8, scale9: 3.2 }[p.pattern];
       return pl + (p.tempo - 100) / 22 + 0.4 * rc(p.root + Math.max(...C.PATTERNS[p.pattern]), ctx);
     },
-    label: p => ({ p5: 'gamme de 5', tierces: 'tierces', melisme: 'mélisme', scale9: 'gamme de 9' })[p.pattern] + ' · ' + nm(p.root) + ' · ♩=' + p.tempo,
+    label: p => ({ p5: 'gamme de 5', tierces: 'tierces', melisme: 'mélisme', scale9: 'gamme de 9' })[p.pattern] + ' · ' + C.patternSpan(p.pattern, p.root) + ' · ♩=' + p.tempo,
     steps(p) {
       const notes = C.PATTERNS[p.pattern].map(x => p.root + x), beat = 60 / p.tempo;
       return [listenSeq(notes, p.tempo), singStep(notes.length * beat + 2, { type: 'notes', targets: notes.map(m => ({ midi: m, dur: beat })), tol: p.tol }, { countIn: 2, tempo: p.tempo, label: 'À toi : léger et précis' })];
@@ -2055,7 +2190,7 @@ window.TB = window.TB || {}; TB.VERSION = "1.0 · 2026-09-26";
     candidates(ctx) { const out = []; for (const note of noteRange(ctx, 3)) out.push({ note }); return out; },
     difficulty: (p, ctx) => 2.6 + 0.7 * rc(p.note, ctx),
     label: p => nm(p.note) + ' · 3 s droit + 3 s vibrato',
-    steps: p => [listenNote(p.note, 1.6), singStep(7.5, { type: 'sustain', target: p.note, tol: 30, split: true }, { label: '3 s droit… puis laisse vibrer', hold: 6 })],
+    steps: p => [{ t: 'listen', play: { kind: 'note', midi: p.note, dur: 4.5, vibratoAt: 2.2 }, label: 'Écoute : droit… puis le vibrato arrive' }, singStep(7.5, { type: 'sustain', target: p.note, tol: 30, split: true }, { label: '3 s droit… puis laisse vibrer', hold: 6 })],
     judge(res, p) {
       const fb = recordingIssues(res);
       if (!res.ok || !res.halves) return { y: null, success: null, fb };
@@ -2103,7 +2238,8 @@ window.TB = window.TB || {}; TB.VERSION = "1.0 · 2026-09-26";
     judge(res, p, ctx) {
       const fb = recordingIssues(res);
       if (!res || !res.ok) return { y: null, success: null, fb };
-      if (res.voice && isFinite(res.voice.cpps)) { const dv = C.densityVerdict(res.voice, Math.round(res.center || 55), ctx); if (dv) fb.push({ kind: dv.level === 'dense' ? 'good' : 'info', text: dv.text }); }
+      // phrase libre (voyelles mêlées) : indication seulement, à comparer avec prudence
+      if (res.voice && isFinite(res.voice.cpps)) { const dv = C.densityVerdict(res.voice, Math.round(res.center || 55), ctx, { vowel: 'mix', snr: res.quality && res.quality.snr }); if (dv) fb.push({ kind: dv.level === 'dense' ? 'good' : 'info', text: dv.text }); }
       if (res.stability && res.stability.vibrato) fb.push({ kind: 'info', text: 'Vibrato naturel : ' + f1(res.stability.rate) + ' Hz' });
       return { y: null, success: null, fb, selfReview: true };
     },
@@ -2132,13 +2268,15 @@ window.TB = window.TB || {}; TB.VERSION = "1.0 · 2026-09-26";
   });
 
   /* -------------------------------------------------- Échauffement & récupération */
+  /** Les glissandos guides suivent la tessiture du profil (Do3 pour un ténor, Do4 pour une voix de femme aiguë…). */
+  const cLow = ctx => (ctx && ctx.profile && isFinite(ctx.profile.comfortLow) ? ctx.profile.comfortLow : 48);
   EX.push({
     id: 'paille', name: 'Paille (SOVT)', comp: null, kind: 'guided', load: 0.2, pillar: 'echauffement', warmup: true,
     why: 'Phonation dans une paille : la résistance à la sortie équilibre les pressions et facilite la vibration avec un minimum d’effort. Échauffement de référence en orthophonie (Titze 2006).',
     how: ['Une paille entre les lèvres (ou lèvres presque fermées, « vvv » si tu n’en as pas).', 'Glisse doucement du grave à l’aigu et retour, puis une petite mélodie.', 'Tout reste facile, aucune pression dans la gorge.'],
     cue: 'Le son part en avant dans la paille, rien ne reste dans la gorge.',
     candidates: () => [{ sec: 90 }], difficulty: () => 0, label: p => Math.round(p.sec / 60 * 10) / 10 + ' min',
-    steps: p => [{ t: 'guided', sec: p.sec, label: 'Paille : glissandos doux', play: { kind: 'glide-loop', from: 48, to: 64, dur: 5 } }],
+    steps: (p, ctx) => [{ t: 'guided', sec: p.sec, label: 'Paille : glissandos doux', play: { kind: 'glide-loop', from: cLow(ctx), to: cLow(ctx) + 16, dur: 5, vowel: 'ou' } }],
     judge: () => ({ y: null, success: null, fb: [] }),
   });
   EX.push({
@@ -2147,7 +2285,7 @@ window.TB = window.TB || {}; TB.VERSION = "1.0 · 2026-09-26";
     how: ['Trille de lèvres (« brrr ») sur des glissandos.', 'Puis « ng » (comme la fin de « parking ») en petites sirènes.', 'Toujours facile.'],
     cue: 'Ça chatouille les lèvres et le nez : c’est là que le son vit.',
     candidates: () => [{ sec: 90 }], difficulty: () => 0, label: p => Math.round(p.sec / 60 * 10) / 10 + ' min',
-    steps: p => [{ t: 'guided', sec: p.sec, label: 'Trilles puis « ng » en sirènes', play: { kind: 'glide-loop', from: 50, to: 67, dur: 5 } }],
+    steps: (p, ctx) => [{ t: 'guided', sec: p.sec, label: 'Trilles puis « ng » en sirènes', play: { kind: 'glide-loop', from: cLow(ctx) + 2, to: cLow(ctx) + 19, dur: 5, vowel: 'ou' } }],
     judge: () => ({ y: null, success: null, fb: [] }),
   });
   EX.push({
@@ -2156,7 +2294,7 @@ window.TB = window.TB || {}; TB.VERSION = "1.0 · 2026-09-26";
     how: ['« mmm » lèvres fermées, du médium vers le grave.', 'Très doux, en baillant légèrement.', 'Termine par un soupir parlé.'],
     cue: 'Un soupir de soulagement, en musique.',
     candidates: () => [{ sec: 60 }], difficulty: () => 0, label: () => '1 min',
-    steps: p => [{ t: 'guided', sec: p.sec, label: '« mmm » descendants très doux', play: { kind: 'glide-loop', from: 60, to: 45, dur: 4 } }],
+    steps: (p, ctx) => [{ t: 'guided', sec: p.sec, label: '« mmm » descendants très doux', play: { kind: 'glide-loop', from: cLow(ctx) + 12, to: cLow(ctx) - 3, dur: 4, vowel: 'ng', oneWay: true } }],
     judge: () => ({ y: null, success: null, fb: [] }),
   });
   EX.push({
@@ -2165,7 +2303,7 @@ window.TB = window.TB || {}; TB.VERSION = "1.0 · 2026-09-26";
     how: ['Paille ou « vvv » très doux, 2 minutes, dans le médium grave.', 'Puis « mmm » sur des mini-mélodies, sans volume.', 'Bois de l’eau, parle peu et sans chuchoter.'],
     cue: 'Le minimum d’effort pour un son qui existe quand même.',
     candidates: () => [{ sec: 240 }], difficulty: () => 0, label: () => '4 min',
-    steps: p => [{ t: 'guided', sec: p.sec, label: 'Paille très douce puis « mmm »', play: { kind: 'glide-loop', from: 48, to: 58, dur: 5 } }],
+    steps: (p, ctx) => [{ t: 'guided', sec: p.sec, label: 'Paille très douce puis « mmm »', play: { kind: 'glide-loop', from: cLow(ctx), to: cLow(ctx) + 10, dur: 5, vowel: 'ng' } }],
     judge: () => ({ y: null, success: null, fb: [] }),
   });
 
@@ -2202,7 +2340,8 @@ window.TB = window.TB || {}; TB.VERSION = "1.0 · 2026-09-26";
     passaggio: [62, 67],               // Ré4 – Sol4 : zone de bascule du ténor
     speech: 50,                        // hauteur de parole (Ré3), mesurée au bilan
     tuning: 440, sessionMin: 25, daysPerWeek: 5,
-    mic: true, headphones: false, timbre: 'voix', liveAssist: 'auto', predict: true,
+    mic: true, timbre: 'voix', predict: true,
+    volume: 1,                         // volume des modèles (1 = 100 %, jusqu'à 2 = 200 %)
   });
 
   St.newState = function (ts) {
@@ -2235,25 +2374,36 @@ window.TB = window.TB || {}; TB.VERSION = "1.0 · 2026-09-26";
   /** Zone de hauteur (tierces) pour les références de densité. */
   St.zone = midi => Math.floor((Math.round(midi) - 36) / 3);
   /**
-   * Référence personnelle de densité : le 80e centile des CPPS mesurés dans la zone
-   * (tes meilleurs sons), au moins 3 mesures. Zones voisines en secours.
+   * Référence personnelle de densité : le 80e centile des CPPS (tes meilleurs sons) parmi les prises les plus
+   * comparables — même zone de hauteur, même voyelle, volume et bruit proches —, au moins 3 mesures.
+   * Le CPPS dépend de la hauteur, de la voyelle, du volume et du bruit de la pièce : comparer des prises
+   * différentes sur ces points ferait passer une condition de mesure pour un défaut de voix.
+   * o : {vowel, levelDb, snr}. Une mesure : [jour, cpps, voyelle, snr, niveau dB, H1–H2] (anciennes : [jour, cpps]).
    */
-  St.densityRef = function (s, midi) {
-    const z = St.zone(midi);
-    for (const zz of [z, z - 1, z + 1]) {
-      const arr = s.dens[zz];
-      if (arr && arr.length >= 3) {
-        const v = arr.map(o => o[1]).sort((a, b) => a - b);
-        const shift = (zz - z) * 1.5;                // le CPPS baisse d'environ 1,5 dB par tierce vers l'aigu
-        return { cpps: v[Math.floor(0.8 * (v.length - 1))] + shift, n: v.length };
-      }
+  St.densityRef = function (s, midi, o) {
+    o = o || {};
+    const z = St.zone(midi), pool = [];
+    for (const zz of [z - 1, z, z + 1]) for (const e of (s.dens[zz] || [])) {
+      const vow = e[2] || null, snr = e[3], lvl = e[4];
+      let dist = Math.abs(zz - z);                                                   // une tierce d'écart = 1
+      if (o.vowel && vow && vow !== o.vowel) dist += 1.5;                            // autre voyelle
+      else if (o.vowel && !vow) dist += 0.5;                                         // ancienne mesure, voyelle inconnue
+      if (isFinite(o.levelDb) && isFinite(lvl)) dist += Math.max(0, Math.abs(o.levelDb - lvl) - 4) / 4;
+      if (isFinite(o.snr) && isFinite(snr)) dist += Math.max(0, Math.abs(o.snr - snr) - 6) / 8;
+      // le CPPS baisse d'environ 2 dB par tierce vers l'aigu : on ramène la mesure voisine à la zone visée
+      if (dist <= 2) pool.push({ cpps: e[1] + (zz - z) * 2, dist, lvl, h1h2: e[5] });
     }
-    return null;
+    if (pool.length < 3) return null;
+    pool.sort((a, b) => a.dist - b.dist);
+    const near = pool.slice(0, Math.max(3, Math.min(12, pool.filter(p => p.dist <= 1).length)));
+    const v = near.map(p => p.cpps).sort((a, b) => a - b);
+    return { cpps: v[Math.floor(0.8 * (v.length - 1))], n: near.length, levelDb: D.median(near.map(p => p.lvl)), h1h2: D.median(near.map(p => p.h1h2)) };
   };
-  St.addDensity = function (s, midi, cpps, ts) {
+  St.addDensity = function (s, midi, cpps, ts, o) {
     if (!isFinite(cpps) || !isFinite(midi)) return;
-    const z = St.zone(midi);
-    (s.dens[z] = s.dens[z] || []).push([today(ts), +cpps.toFixed(2)]);
+    o = o || {};
+    const z = St.zone(midi), r1 = v => (isFinite(v) ? +(+v).toFixed(1) : null);
+    (s.dens[z] = s.dens[z] || []).push([today(ts), +cpps.toFixed(2), o.vowel || null, r1(o.snr), r1(o.levelDb), r1(o.h1h2)]);
     if (s.dens[z].length > 40) s.dens[z].splice(0, s.dens[z].length - 40);
   };
 
@@ -2263,6 +2413,7 @@ window.TB = window.TB || {}; TB.VERSION = "1.0 · 2026-09-26";
     const arr = s.series[key] = s.series[key] || [];
     const d = today(ts), last = arr[arr.length - 1];
     if (last && last[0] === d && (key === 'hiss' || key === 'mpt' || key === 'hi' || key === 'vfe')) last[1] = Math.max(last[1], value);
+    else if (last && last[0] === d && key === 'jnd') last[1] = Math.min(last[1], +value.toFixed(2));
     else arr.push([d, +value.toFixed(2)]);
     if (arr.length > 500) arr.splice(0, arr.length - 500);
   };
@@ -2275,7 +2426,7 @@ window.TB = window.TB || {}; TB.VERSION = "1.0 · 2026-09-26";
       bestVfe: vfe && vfe.length ? Math.max(...vfe.slice(-12).map(x => x[1])) : null,
       profile: s.profile,
       rangeShift: plan ? plan.rangeShift || 0 : 0,
-      densityRef: midi => St.densityRef(s, midi),
+      densityRef: (midi, o) => St.densityRef(s, midi, o),
       song: song ? song.title : '',
     };
   };
@@ -2302,11 +2453,13 @@ window.TB = window.TB || {}; TB.VERSION = "1.0 · 2026-09-26";
     // statistiques de l'exercice
     const it = s.items[take.ex] = s.items[take.ex] || { n: 0, ok: 0, last: 0, first: ts };
     it.n++; if (j.success) it.ok++; it.last = ts; it.lastD = take.d;
-    // densité et séries
-    const r = take.res;
-    if (r && r.voice && isFinite(r.voice.cpps) && r.ok !== false && !(r.issues || []).includes('unreliable')) {
+    // densité : seulement les prises captées dans de bonnes conditions (bruit ≥ 30 dB sous la voix),
+    // avec leur voyelle, leur volume et leur bruit pour ne comparer que des prises comparables
+    const r = take.res, C = TB.catalog;
+    if (r && r.voice && isFinite(r.voice.cpps) && r.ok !== false && !(r.issues || []).includes('unreliable') && isFinite(r.snr) && r.snr >= C.DENSITY_SNR && !(ex && ex.kind === 'song')) {
       const midi = isFinite(r.voiceMidi) ? r.voiceMidi : (take.params && (take.params.note || take.params.root));
-      if (isFinite(midi) && take.ex !== 'parle-chante') St.addDensity(s, midi, r.voice.cpps, ts);
+      const vowel = C.vowelClass((take.params && take.params.vowel) || St.EX_VOWEL[take.ex] || 'a');
+      if (isFinite(midi)) St.addDensity(s, midi, r.voice.cpps, ts, { vowel, snr: r.snr, levelDb: r.voice.levelDb, h1h2: r.voice.h1h2 });
     }
     const m = j.metrics || {};
     if (isFinite(m.hiss)) St.addSeries(s, 'hiss', m.hiss, ts);
@@ -2314,15 +2467,18 @@ window.TB = window.TB || {}; TB.VERSION = "1.0 · 2026-09-26";
     if (isFinite(m.vfe)) St.addSeries(s, 'vfe', m.vfe, ts);
     if ((take.ex === 'tenue' || take.ex === 'memoire') && isFinite(m.err)) St.addSeries(s, 'tenueErr', Math.abs(m.err), ts);
     if (isFinite(m.meanAbs)) St.addSeries(s, 'melErr', m.meanAbs, ts);
+    if (isFinite(m.jnd)) St.addSeries(s, 'jnd', m.jnd, ts);
     if (take.ex === 'sirene' && isFinite(m.hi) && m.breaks === 0) St.addSeries(s, 'hi', m.hi, ts);
-    if (take.ex === 'parle-chante' && isFinite(m.speechCpps)) { St.addSeries(s, 'speechCpps', m.speechCpps, ts); St.addSeries(s, 'singCpps', m.cpps, ts); }
-    if (take.ex === 'parle-chante' && take.pre && take.pre[0] && isFinite(take.pre[0].center)) s.profile.speech = Math.round(0.7 * s.profile.speech + 0.3 * take.pre[0].center);
+    if (take.ex === 'parle-chante' && isFinite(m.gap)) St.addSeries(s, 'pcGap', m.gap, ts);
     // auto-évaluation avant le résultat (« oreille interne »)
     if (take.predicted && take.predicted !== '?') {
       const truth = St.truthOf(take, m, j);
       if (truth) take.calib = St.addCalibration(s, take.predicted, truth);
     }
   };
+
+  /** Voyelle chantée des exercices dont les paramètres ne la précisent pas. */
+  St.EX_VOWEL = { legato: 'ou', 'aigu-tenu': 'o', voyelle: 'o', vfe: 'o' };
 
   /** Vérité mesurée comparable à l'auto-évaluation : tenue → juste/bas/haut ; mélodie → juste/faux. */
   St.truthOf = function (take, m, j) {
@@ -2353,7 +2509,7 @@ window.TB = window.TB || {}; TB.VERSION = "1.0 · 2026-09-26";
 
   /* ---------------------------------------------------------------- séances */
   St.startSession = function (s, plan, ts) {
-    const sess = { id: 's' + (ts || Date.now()), date: today(ts), ts: ts || Date.now(), type: plan.type, week: plan.week, planned: plan.minutes, checkin: plan.checkin || null, takes: [], done: false, load: 0 };
+    const sess = { id: 's' + (ts || Date.now()), date: today(ts), ts: ts || Date.now(), type: plan.type, week: plan.week, bilanWeek: plan.bilanWeek || null, planned: plan.minutes, checkin: plan.checkin || null, takes: [], done: false, load: 0 };
     if (plan.type === 'B') { sess.startSkills = {}; for (const [k, v] of Object.entries(s.skills)) sess.startSkills[k] = { th: v.th, sd: v.sd }; }
     return sess;
   };
@@ -2457,7 +2613,7 @@ window.TB = window.TB || {}; TB.VERSION = "1.0 · 2026-09-26";
 
   /* durée estimée d'une prise (écoute + chant + lecture du retour), en secondes */
   function takeSec(ex) {
-    const fixed = { vfe: 240, tenue: 22, memoire: 24, echo: 28, intervalle: 20, discri: 100, sss: 55, tpm: 45, attaques: 24, 'parle-chante': 32, messa: 26,
+    const fixed = { vfe: 240, tenue: 22, memoire: 24, echo: 28, intervalle: 20, discri: 110, sss: 55, tpm: 45, attaques: 24, 'parle-chante': 26, messa: 28,
       descentes: 24, appel: 22, goug: 30, pont: 28, octaves: 24, 'aigu-haut': 26, sirene: 24, voyelle: 22, 'aigu-tenu': 22,
       agilite: 26, vibrato: 26, legato: 30, phrase: 75, simulation: 200, imagerie: 130 };
     return fixed[ex.id] || 30;
@@ -2517,11 +2673,18 @@ window.TB = window.TB || {}; TB.VERSION = "1.0 · 2026-09-26";
     return Math.max(0, 3 - after);
   };
 
-  /** Bilan à proposer ? Entrée (aucun bilan), puis fin des semaines 4, 8, 12, 16. */
+  /** Bilan d'étape à faire : fin des semaines 4, 8, 12, 16 — rattrapé la semaine suivante s'il a été manqué. */
+  P.bilanTarget = function (s, week) {
+    const due = week % 4 === 0 ? week : week % 4 === 1 && week > 4 ? week - 1 : null;
+    if (!due || s.bilans.some(b => b.week === due && b.cycle === s.program.cycle)) return null;
+    return due;
+  };
+  /** Bilan à proposer ? Entrée (aucun bilan), puis fin des semaines 4, 8, 12, 16 (ou rattrapage). */
   P.bilanDue = function (s, week, dateStr) {
     if (!s.bilans.length) return P.repriseLeft(s, dateStr) > 0 ? null : 'entree';   // pas de bilan sur une voix convalescente
-    if (week % 4 !== 0) return null;
-    if (s.bilans.some(b => b.week === week && b.cycle === s.program.cycle)) return null;
+    const due = P.bilanTarget(s, week);
+    if (!due) return null;
+    if (due !== week) return 'etape';                 // rattrapage : dès la semaine suivante
     const inWeek = s.sessions.filter(x => St.programWeek(s, x.date) === week && x.type !== 'B').length;
     return inWeek >= 2 ? 'etape' : null;
   };
@@ -2653,6 +2816,18 @@ window.TB = window.TB || {}; TB.VERSION = "1.0 · 2026-09-26";
       Object.assign(victim, { ex: ex.id, comp: o.id, takes: nTakes(ex), isNew: !s.items[ex.id], rescued: true });
       plan.reasons.push('Rappel espacé : ' + M.COMP[o.id].name.toLowerCase() + ' (pas travaillé depuis ' + Math.round(o.days) + ' j)');
     }
+    // alternance : un exercice déjà bien connu (≥ 6 prises) alterne avec un autre exercice connu de la même
+    // compétence. Une fois la base acquise, varier d'une prise à l'autre fait mieux retenir que répéter
+    // (interférence contextuelle : Shea & Morgan 1979 ; point de défi : Guadagnoli & Lee 2004).
+    if (type !== 'A') for (const it of items) {
+      if (!it.ex || it.mix || it.rescued || it.takes < 4) continue;
+      const e = C.EX[it.ex];
+      if (!e || e.kind !== 'sing' || e.id === 'vfe' || ((s.items[e.id] || {}).n || 0) < 6) continue;
+      const mates = C.byComp(it.comp).filter(x => x.id !== e.id && x.kind === 'sing' && x.id !== 'vfe' && ((s.items[x.id] || {}).n || 0) >= 6 && !items.some(o => o.ex === x.id || (o.mix && o.mix.includes(x.id))));
+      if (!mates.length) continue;
+      const mate = mates[Math.floor(r() * mates.length) % mates.length];
+      it.mix = [e.id, mate.id]; it.label = e.name + ' ⇄ ' + mate.name;
+    }
     // ajuste le nombre de prises pour tenir la durée prévue (± une prise par bloc)
     const est = () => items.reduce((a, it) => a + it.takes * (it.mix ? 24 : takeSec(C.EX[it.ex])), 0);
     for (let guard = 0; guard < 30; guard++) {
@@ -2712,6 +2887,8 @@ window.TB = window.TB || {}; TB.VERSION = "1.0 · 2026-09-26";
   P.bilanPlan = function (s, plan, ctx, kind) {
     const pr = s.profile, p0 = pr.passaggio[0], p1 = pr.passaggio[1];
     plan.type = 'B'; plan.bilan = kind || 'etape';
+    // semaine de programme que ce bilan conclut (rattrapage compris)
+    plan.bilanWeek = plan.bilan === 'entree' ? 0 : (P.bilanTarget(s, plan.week) || plan.week);
     plan.title = kind === 'entree' ? 'Bilan d’entrée' : 'Bilan de fin de bloc';
     plan.targetP = 0.8; plan.rangeShift = 0;
     const melSeeds = [[11, 4, 4], [22, 6, 7], [33, 8, 9]];   // graine, longueur, saut max
@@ -2729,7 +2906,7 @@ window.TB = window.TB || {}; TB.VERSION = "1.0 · 2026-09-26";
       { ex: 'sirene', fixed: [{ lo: pr.comfortLow, hi: Math.min(pr.high, p1 + 5), vowel: 'ou', dur: 7 }], comp: 'passage', bilan: true },
       { ex: 'goug', fixed: [{ root: p1 + 2 - 16, tempo: 100, tol: 30, pattern: 'arp9', vowel: 'goug' }], comp: 'passage', bilan: true },
       { ex: 'aigu-tenu', ladder: { from: p1 - 1, to: pr.high, tol: 30 }, comp: 'aigu', bilan: true },
-      { ex: 'discri', fixed: [{ cents: 50, note: pr.comfortLow + 7, trials: 12 }], comp: 'oreille', bilan: true },
+      { ex: 'discri', fixed: [{ cents: 30, note: pr.comfortLow + 7, trials: 24 }], comp: 'oreille', bilan: true },
       { ex: 'sss', fixed: [{ target: Math.max(20, Math.round(bestOf(s, 'hiss') || 25)) }], comp: 'souffle', bilan: true },
     ];
     plan.minutes = 16;
@@ -2768,9 +2945,10 @@ window.TB = window.TB || {}; TB.VERSION = "1.0 · 2026-09-26";
       }
     }
     // mesures directes du bilan (seuil d'oreille, durée de « ssss »…) : réappliquées une fois sur l'estimation
-    for (const o of obs) if (reset.has(o.comp)) M.observe(s.skills[o.comp], o.level, o.noise, ts);
+    // (une compétence mesurée seulement par une observation, comme le seuil d'oreille, l'a déjà intégrée pendant la prise)
+    for (const o of obs) { if (reset.has(o.comp)) M.observe(s.skills[o.comp], o.level, o.noise, ts); else if (s.skills[o.comp]) reset.add(o.comp); }
     for (const c of M.COMPS) after[c.id] = +s.skills[c.id].th.toFixed(2);
-    const rec = { date: St.today(ts), week: kind === 'entree' ? 0 : sess.week, cycle: s.program.cycle, kind, before, after, measured: Array.from(reset), overall: +M.overall(s.skills).toFixed(2) };
+    const rec = { date: St.today(ts), week: kind === 'entree' ? 0 : (sess.bilanWeek || sess.week), cycle: s.program.cycle, kind, before, after, measured: Array.from(reset), overall: +M.overall(s.skills).toFixed(2) };
     s.bilans.push(rec);
     return rec;
   };
@@ -2926,7 +3104,7 @@ window.TB = window.TB || {}; TB.VERSION = "1.0 · 2026-09-26";
   'use strict';
   const TB = root.TB || (root.TB = {});
   const A = {};
-  let ctx = null, master = null, comp = null, mic = null, micSrc = null, analyser = null, recNode = null, sink = null;
+  let ctx = null, master = null, bus = null, mic = null, micSrc = null, analyser = null, recNode = null, sink = null;
   let recording = false, chunks = [], recLen = 0, onChunk = null;
   const active = new Set();
 
@@ -2940,10 +3118,7 @@ window.TB = window.TB || {}; TB.VERSION = "1.0 · 2026-09-26";
       const AC = root.AudioContext || root.webkitAudioContext;
       if (!AC) throw new Error('Web Audio indisponible');
       ctx = new AC({ latencyHint: 'interactive' });
-      comp = ctx.createDynamicsCompressor();
-      comp.threshold.value = -10; comp.knee.value = 6; comp.ratio.value = 12; comp.attack.value = 0.003; comp.release.value = 0.25;
-      master = ctx.createGain(); master.gain.value = 0.85;
-      master.connect(comp); comp.connect(ctx.destination);
+      ({ master, bus } = buildOutput(ctx));
       // déverrouillage iOS : un tampon silencieux joué dans le geste utilisateur
       const b = ctx.createBuffer(1, 1, ctx.sampleRate), s = ctx.createBufferSource(); s.buffer = b; s.connect(ctx.destination); try { s.start(0); } catch (e) { /* rien */ }
     }
@@ -2960,9 +3135,34 @@ window.TB = window.TB || {}; TB.VERSION = "1.0 · 2026-09-26";
     ['touchend', 'click'].forEach(ev => root.document.addEventListener(ev, kick, true));
   }
   A.now = () => (ctx ? ctx.currentTime : 0);
-  A.setVolume = v => { if (master) master.gain.value = v; };
+  /* ------------------------------------------------------------ sortie et volume */
+  // Chaîne de sortie : volume réglable → limiteur doux (saturation en tangente hyperbolique, sans écrêtage dur).
+  // Micro ouvert, iOS joue plus bas : le niveau par défaut est plus fort qu'avant, et le volume va de 50 à 200 % ;
+  // au-dessus de 100 %, le limiteur réduit les crêtes pour gagner en volume perçu sans saturer la sortie.
+  A.userVolume = 1;
+  const OUT_GAIN = 5.0;                 // gain des modèles à 100 % (≈ 4 dB plus fort qu’avant)
+  let shaperCurve = null;
+  function buildOutput(c) {
+    const m = c.createGain(); m.gain.value = OUT_GAIN * A.userVolume;
+    const b = c.createGain(); b.gain.value = 0.25;               // entrée du limiteur : ±4 → ±1
+    const sh = c.createWaveShaper(), post = c.createGain();
+    if (!shaperCurve) { shaperCurve = new Float32Array(2049); for (let i = 0; i < 2049; i++) shaperCurve[i] = Math.tanh(4 * (i / 1024 - 1)); }
+    sh.curve = shaperCurve; sh.oversample = '4x'; post.gain.value = 0.95;
+    m.connect(b); b.connect(sh); sh.connect(post); post.connect(c.destination);
+    return { master: m, bus: b };
+  }
+  /** Volume des modèles (1 = 100 %). */
+  A.setUserVolume = function (v) {
+    A.userVolume = Math.max(0.5, Math.min(2, +v || 1));
+    if (master && ctx) { try { master.gain.setTargetAtTime(OUT_GAIN * A.userVolume, ctx.currentTime, 0.02); } catch (e) { master.gain.value = OUT_GAIN * A.userVolume; } }
+  };
 
   /* ------------------------------------------------------------ voix de synthèse */
+  // Synthèse source-filtre : une source glottale (harmoniques en 1/k^1,05) passe dans des formants FIXES
+  // en Hz, comme une vraie voix : la voyelle et le timbre restent les mêmes quelle que soit la note, seule,
+  // dans une mélodie ou dans un glissando. (Avant, le spectre suivait la note médiane de la mélodie : une même
+  // note changeait de couleur selon le contexte, ce qui déforme la hauteur et les intervalles perçus —
+  // Russo & Thompson 2005.)
   const VOWELS = {
     a: [[730, 90, 1], [1090, 110, 0.5], [2440, 160, 0.22], [3000, 400, 0.12], [3400, 250, 0.08]],
     ou: [[300, 70, 1], [870, 90, 0.3], [2240, 150, 0.06], [3000, 400, 0.05]],
@@ -2971,58 +3171,147 @@ window.TB = window.TB || {}; TB.VERSION = "1.0 · 2026-09-26";
     i: [[280, 60, 1], [2250, 110, 0.22], [3000, 160, 0.2], [3400, 250, 0.1]],
     ng: [[280, 70, 1], [1000, 200, 0.05], [2600, 300, 0.03]],
   };
-  const VOWEL_OF = { a: 'a', ya: 'a', la: 'a', 'é': 'e', e: 'e', 'hé': 'e', nay: 'e', ou: 'ou', goug: 'ou', mum: 'ou', u: 'ou', wi: 'i', oui: 'i', i: 'i', ng: 'ng', mmm: 'ng', m: 'ng', o: 'o', 'ɔ': 'o' };
+  const VOWEL_OF = { a: 'a', ya: 'a', la: 'a', 'é': 'e', e: 'e', 'hé': 'e', nay: 'e', ou: 'ou', goug: 'ou', mum: 'ou', u: 'ou', wi: 'i', oui: 'i', i: 'i', ng: 'ng', mmm: 'ng', m: 'ng', o: 'o', 'ɔ': 'o', ol: 'o' };
   A.vowelOf = v => VOWEL_OF[String(v || 'a').toLowerCase()] || 'a';
-  const waveCaches = new WeakMap();                 // une forme d'onde appartient à un contexte audio
-  function voiceWave(f0, vowel) {
-    let waveCache = waveCaches.get(ctx);
-    if (!waveCache) { waveCache = new Map(); waveCaches.set(ctx, waveCache); }
-    const key = vowel + ':' + Math.round(f0 / 8);
-    let w = waveCache.get(key);
-    if (w) return w;
-    const F = VOWELS[vowel] || VOWELS.a;
-    const n = Math.max(2, Math.min(64, Math.floor(5500 / f0)));
-    const real = new Float32Array(n + 1), imag = new Float32Array(n + 1);
-    for (let k = 1; k <= n; k++) {
-      const f = k * f0;
-      let h = 0.02;
-      for (const [Fi, Bi, Gi] of F) h += Gi / Math.sqrt(1 + Math.pow((f - Fi) / (Bi / 2), 2));
-      imag[k] = h / Math.pow(k, 1.05);
+  const SRC_N = 64, SRC_TILT = 1.05;
+  // crête de la forme d'onde source (le navigateur la normalise à une crête de 1)
+  const SRC_PEAK = (() => { let pk = 0; for (let i = 0; i < 2048; i++) { const th = 2 * Math.PI * i / 2048; let v = 0; for (let k = 1; k <= SRC_N; k++) v += Math.sin(k * th) / Math.pow(k, SRC_TILT); pk = Math.max(pk, Math.abs(v)); } return pk; })();
+  const srcWaves = new WeakMap();                    // une forme d'onde appartient à un contexte audio
+  function sourceWave() {
+    let w = srcWaves.get(ctx); if (w) return w;
+    const real = new Float32Array(SRC_N + 1), imag = new Float32Array(SRC_N + 1);
+    for (let k = 1; k <= SRC_N; k++) imag[k] = 1 / Math.pow(k, SRC_TILT);
+    w = ctx.createPeriodicWave(real, imag); srcWaves.set(ctx, w); return w;
+  }
+  // Clarté de hauteur sur haut-parleur : le petit haut-parleur d'un téléphone ne rend pas le fondamental des
+  // notes graves ; l'oreille reconstruit alors la hauteur grâce aux harmoniques 3 à 6. Sur « ou », « i », « é »,
+  // l'harmonique 2 (renforcée par le 1er formant) les écrase et la note peut sembler une octave trop haute
+  // (surtout pour les auditeurs qui entendent la hauteur « spectrale » : Schneider et al. 2005).
+  // Un filtre en plateau, placé entre l'harmonique 2 et l'harmonique 3 et d'autant plus fort que la note est
+  // grave, rehausse les harmoniques 3 et suivantes sans déplacer les formants.
+  const FLOOR = 0.05;
+  const shelfDbFor = f0 => Math.max(0, Math.min(14, 14 * (320 - f0) / 170));
+  /** |H|² du filtre en plateau aigu de Web Audio (RBJ, pente S = 1) à la fréquence f. */
+  function shelfPow(f, fc, dB, sr) {
+    if (dB <= 0.01) return 1;
+    const A = Math.pow(10, dB / 40), w0 = 2 * Math.PI * Math.min(fc, 0.45 * sr) / sr, cw = Math.cos(w0), al = Math.sin(w0) / 2 * Math.SQRT2, sA = 2 * Math.sqrt(A) * al;
+    const b0 = A * ((A + 1) + (A - 1) * cw + sA), b1 = -2 * A * ((A - 1) + (A + 1) * cw), b2 = A * ((A + 1) + (A - 1) * cw - sA);
+    const a0 = (A + 1) - (A - 1) * cw + sA, a1 = 2 * ((A - 1) - (A + 1) * cw), a2 = (A + 1) - (A - 1) * cw - sA;
+    const w = 2 * Math.PI * f / sr, c1 = Math.cos(w), s1 = Math.sin(w), c2 = Math.cos(2 * w), s2 = Math.sin(2 * w);
+    const nr = b0 + b1 * c1 + b2 * c2, ni = -(b1 * s1 + b2 * s2), dr = a0 + a1 * c1 + a2 * c2, di = -(a1 * s1 + a2 * s2);
+    return (nr * nr + ni * ni) / (dr * dr + di * di);
+  }
+  /** Réponse complexe [re, im] du passe-bande biquad de Web Audio (RBJ) centré sur fc, à la fréquence f. */
+  function bpResp(f, fc, q, sr) {
+    const w0 = 2 * Math.PI * fc / sr, al = Math.sin(w0) / (2 * q), w = 2 * Math.PI * f / sr, cw0 = Math.cos(w0);
+    const c1 = Math.cos(w), s1 = Math.sin(w), c2 = Math.cos(2 * w), s2 = Math.sin(2 * w);
+    const nr = al - al * c2, ni = al * s2;
+    const dr = (1 + al) - 2 * cw0 * c1 + (1 - al) * c2, di = 2 * cw0 * s1 - (1 - al) * s2, den = dr * dr + di * di;
+    return [(nr * dr + ni * di) / den, (ni * dr - nr * di) / den];
+  }
+  /** Gain qui donne à une note de la voix le même niveau (efficace) quelle que soit sa place sous les formants. */
+  const gainCache = new Map();
+  function voiceGain(f0, vowel, sr) {
+    const key = vowel + ':' + Math.round(f0 * 4) + ':' + sr; let g = gainCache.get(key); if (g) return g;
+    const F = VOWELS[vowel] || VOWELS.a, sh = shelfDbFor(f0);
+    let p = 0;
+    for (let k = 1; k <= SRC_N && k * f0 < 0.48 * sr; k++) {
+      let re = FLOOR, im = 0;
+      for (let i = 0; i < F.length; i++) { const [fc, bw, gn] = F[i], h = bpResp(k * f0, fc, fc / bw, sr), sg = i % 2 ? -gn : gn; re += sg * h[0]; im += sg * h[1]; }
+      const a = 1 / Math.pow(k, SRC_TILT) / SRC_PEAK;
+      p += a * a * (re * re + im * im) * shelfPow(k * f0, 2.5 * f0, sh, sr) / 2;
     }
-    w = ctx.createPeriodicWave(real, imag);
-    waveCache.set(key, w);
-    if (waveCache.size > 200) waveCache.delete(waveCache.keys().next().value);
-    return w;
+    g = 0.25 / Math.sqrt(p || 1e-9);
+    gainCache.set(key, g); if (gainCache.size > 600) gainCache.delete(gainCache.keys().next().value);
+    return g;
+  }
+  /** Une voix : source → formants fixes (branche parallèle de Klatt, signes alternés) → enveloppe. */
+  function makeVoice(vowel, out) {
+    const F = VOWELS[vowel] || VOWELS.a;
+    const src = ctx.createOscillator(); src.setPeriodicWave(sourceWave());
+    const sum = ctx.createGain(), env = ctx.createGain(), floor = ctx.createGain(), shelf = ctx.createBiquadFilter();
+    env.gain.value = 0; floor.gain.value = FLOOR; src.connect(floor); floor.connect(sum);
+    shelf.type = 'highshelf'; shelf.frequency.value = 500; shelf.gain.value = 0;
+    for (let i = 0; i < F.length; i++) {
+      const [fc, bw, gn] = F[i], bp = ctx.createBiquadFilter(), g = ctx.createGain();
+      bp.type = 'bandpass'; bp.frequency.value = fc; bp.Q.value = fc / bw; g.gain.value = i % 2 ? -gn : gn;
+      src.connect(bp); bp.connect(g); g.connect(sum);
+    }
+    sum.connect(shelf); shelf.connect(env); env.connect(out || master);
+    const lfo = ctx.createOscillator(), lg = ctx.createGain();
+    lfo.frequency.value = 5.4; lg.gain.value = 0; lfo.connect(lg); lg.connect(src.detune);
+    return { src, env, shelf, lfo, lg };
+  }
+  /** Plateau de clarté selon la hauteur f (immédiat, ou en rampe jusqu'à t). */
+  function setColor(v, f, t, ramp) {
+    const fc = Math.min(2.5 * f, 0.45 * ctx.sampleRate), g = shelfDbFor(f);
+    if (ramp) { v.shelf.frequency.linearRampToValueAtTime(fc, t); v.shelf.gain.linearRampToValueAtTime(g, t); }
+    else { v.shelf.frequency.setValueAtTime(fc, t); v.shelf.gain.setValueAtTime(g, t); }
   }
 
-  /** Joue une note ou une suite legato à la voix. notes : [{midi, t (s), dur}] relatifs à t0. */
+  /**
+   * Joue une note ou une suite à la voix. notes : [{midi, t (s), dur}] relatifs au départ.
+   * o : {at, vowel, volume, detached, swell, vibratoAt (s), out}. Son droit par défaut : un modèle sans vibrato
+   * s'imite plus juste, surtout quand on doute de sa justesse (Yarbrough, Bowers & Benson 1992).
+   */
   function voiceLine(notes, o) {
     o = o || {};
-    const t0 = (o.at || ctx.currentTime) + 0.03, vowel = A.vowelOf(o.vowel);
-    const osc = ctx.createOscillator(), g = ctx.createGain();
-    const fMed = A.midiToHz(notes.map(n => n.midi).sort((a, b) => a - b)[notes.length >> 1]);
-    osc.setPeriodicWave(voiceWave(fMed, vowel));
-    const vol = (o.volume || 0.5);
-    // vibrato naturel : 5,4 Hz, ±18 cents, qui s'installe après 0,3 s
-    const lfo = ctx.createOscillator(), lg = ctx.createGain();
-    lfo.frequency.value = 5.4; lg.gain.value = 0;
-    lfo.connect(lg); lg.connect(osc.detune);
-    notes.forEach((n, i) => {
-      const f = A.midiToHz(n.midi), t = t0 + n.t;
-      if (i === 0) osc.frequency.setValueAtTime(f, t);
-      else { osc.frequency.setValueAtTime(A.midiToHz(notes[i - 1].midi), t - 0.001); osc.frequency.exponentialRampToValueAtTime(f, t + 0.04); }
-      if (o.detached && i > 0) { g.gain.setValueAtTime(vol, t - 0.07); g.gain.linearRampToValueAtTime(0.0001, t - 0.03); g.gain.linearRampToValueAtTime(vol, t + 0.03); }
-    });
+    const t0 = (o.at || ctx.currentTime) + 0.03, vowel = A.vowelOf(o.vowel), sr = ctx.sampleRate;
+    const v = makeVoice(vowel, o.out), vol = o.volume || 0.5;
+    const lev = m => vol * voiceGain(A.midiToHz(m), vowel, sr);
+    const F = v.src.frequency, G = v.env.gain;
     const end = t0 + Math.max(...notes.map(n => n.t + n.dur));
-    g.gain.setValueAtTime(0.0001, t0);
-    g.gain.linearRampToValueAtTime(vol, t0 + 0.06);
-    g.gain.setValueAtTime(vol, end - 0.12);
-    g.gain.linearRampToValueAtTime(0.0001, end);
-    if (!o.straight) { lg.gain.setValueAtTime(0, t0); lg.gain.setValueAtTime(0, t0 + 0.3); lg.gain.linearRampToValueAtTime(18, t0 + 0.7); }
-    osc.connect(g); g.connect(o.out || master);
-    osc.start(t0); lfo.start(t0); osc.stop(end + 0.05); lfo.stop(end + 0.05);
-    track([osc, lfo], end);
+    if (o.detached) {
+      // notes détachées : chaque note a sa propre attaque, séparée de la suivante par un vrai silence
+      G.setValueAtTime(0, t0);
+      notes.forEach(n => {
+        const f = A.midiToHz(n.midi), t = t0 + n.t, e = t + Math.max(0.15, n.dur * 0.6), L = lev(n.midi);
+        F.setValueAtTime(f, t); setColor(v, f, t);
+        G.setValueAtTime(0.0001, t); G.linearRampToValueAtTime(L, t + 0.02); G.setValueAtTime(L, e - 0.06); G.linearRampToValueAtTime(0.0001, e);
+      });
+    } else {
+      notes.forEach((n, i) => {
+        const f = A.midiToHz(n.midi), t = t0 + n.t, L = lev(n.midi);
+        if (i === 0) { F.setValueAtTime(f, t); setColor(v, f, t); G.setValueAtTime(0.0001, t); G.linearRampToValueAtTime(o.swell ? L * 0.3 : L, t + 0.06); return; }
+        const fp = A.midiToHz(notes[i - 1].midi);
+        F.setValueAtTime(fp, t - 0.001); F.exponentialRampToValueAtTime(f, t + 0.04);
+        setColor(v, fp, t - 0.001); setColor(v, f, t + 0.04, true);
+        G.setValueAtTime(lev(notes[i - 1].midi), t - 0.001); G.linearRampToValueAtTime(L, t + 0.04);
+      });
+      const last = lev(notes[notes.length - 1].midi);
+      if (o.swell) {                                // messa di voce : doux → fort → doux (≈ 10 dB)
+        G.linearRampToValueAtTime(last, t0 + (end - t0) / 2); G.linearRampToValueAtTime(last * 0.3, end - 0.12);
+      } else G.setValueAtTime(last, end - 0.12);
+      G.linearRampToValueAtTime(0.0001, end);
+    }
+    // vibrato de démonstration (« Droit puis vibrato ») : 5,4 Hz, ±40 cents, à partir de vibratoAt
+    if (isFinite(o.vibratoAt)) { v.lg.gain.setValueAtTime(0, t0 + o.vibratoAt); v.lg.gain.linearRampToValueAtTime(40, t0 + o.vibratoAt + 0.5); }
+    v.src.start(t0); v.lfo.start(t0); v.src.stop(end + 0.05); v.lfo.stop(end + 0.05);
+    track([v.src, v.lfo], end);
     return end;
+  }
+
+  /** Glissando à la voix (aller-retour, ou aller seul avec oneWay), formants fixes, niveau constant. */
+  function voiceGlide(from, to, dur, o) {
+    o = o || {};
+    const t0 = o.at, vowel = A.vowelOf(o.vowel || 'ou'), sr = ctx.sampleRate;
+    const v = makeVoice(vowel, o.out), vol = o.volume || 0.5, F = v.src.frequency, G = v.env.gain;
+    F.setValueAtTime(A.midiToHz(from), t0);
+    if (o.oneWay) F.exponentialRampToValueAtTime(A.midiToHz(to), t0 + dur);
+    else { F.exponentialRampToValueAtTime(A.midiToHz(to), t0 + dur / 2); F.exponentialRampToValueAtTime(A.midiToHz(from), t0 + dur); }
+    const N = 12;
+    G.setValueAtTime(0.0001, t0);
+    for (let i = 0; i <= N; i++) {
+      const u = i / N, t = t0 + u * dur;
+      const m = o.oneWay ? from + (to - from) * u : u <= 0.5 ? from + (to - from) * 2 * u : to + (from - to) * (2 * u - 1);
+      const f = A.midiToHz(m), L = vol * voiceGain(f, vowel, sr);
+      if (i === 0) { setColor(v, f, t0); G.linearRampToValueAtTime(L, t0 + 0.12); }
+      else if (i < N) { setColor(v, f, t, true); G.linearRampToValueAtTime(L, t); }
+      else { setColor(v, f, t, true); G.linearRampToValueAtTime(L, t - 0.15); G.linearRampToValueAtTime(0.0001, t); }
+    }
+    v.src.start(t0); v.lfo.start(t0); v.src.stop(t0 + dur + 0.05); v.lfo.stop(t0 + dur + 0.05);
+    track([v.src, v.lfo], t0 + dur);
+    return t0 + dur;
   }
 
   /** Piano simple : partiels à décroissance exponentielle. */
@@ -3070,49 +3359,35 @@ window.TB = window.TB || {}; TB.VERSION = "1.0 · 2026-09-26";
     const ms = Math.max(0, (end - ctx.currentTime) * 1000);
     return new Promise(res => setTimeout(() => res(true), ms + 30));
   };
-  /** Rendu hors temps réel d'un modèle (tests de justesse du modèle lui-même). */
+  /** Rendu hors temps réel d'un modèle (tests de justesse et de niveau du modèle lui-même, même chaîne de sortie). */
   A.renderOffline = async function (play, opt, sr) {
     sr = sr || 16000;
     const OAC = root.OfflineAudioContext || root.webkitOfflineAudioContext;
-    const dur = (play.dur || 2) + (play.notes ? play.notes.length * 60 / (play.tempo || 90) : 0) + 1;
+    const dur = (play.dur || 2) + (play.notes ? play.notes.length * 60 / (play.tempo || 90) : 0) + (play.pre || 0) + 1;
     const off = new OAC(1, Math.ceil(sr * dur), sr);
-    const saved = [ctx, master];
-    ctx = off; master = off.createGain(); master.gain.value = 0.85; master.connect(off.destination);
-    try { schedule(play, Object.assign({ at0: 0 }, opt || {})); } finally { [ctx, master] = saved; }
+    const saved = [ctx, master, bus];
+    ctx = off; ({ master, bus } = buildOutput(off));
+    try { schedule(play, opt || {}); } finally { [ctx, master, bus] = saved; }
     const buf = await off.startRendering();
     return { pcm: buf.getChannelData(0), sr };
   };
   function schedule(play, opt) {
     const timbre = play.timbre || opt.timbre || 'voix';
-    const vol = opt.volume || 0.5;
+    const vol = opt.volume || 0.5, vowel = play.vowel || opt.vowel;
     let end = ctx.currentTime;
     const at = ctx.currentTime + (play.pre || 0);
     if (play.kind === 'note') {
       if (timbre === 'piano') end = pianoNote(play.midi, at + 0.03, play.dur || 1.5, vol);
-      else end = voiceLine([{ midi: play.midi, t: 0, dur: play.dur || 2 }], { at, vowel: play.vowel || opt.vowel, volume: vol, straight: play.straight });
+      else end = voiceLine([{ midi: play.midi, t: 0, dur: play.dur || 2 }], { at, vowel, volume: vol, swell: play.swell, vibratoAt: play.vibratoAt });
     } else if (play.kind === 'seq') {
       const beat = 60 / (play.tempo || 90);
-      if (timbre === 'piano') { play.notes.forEach((m, i) => { end = pianoNote(m, at + 0.03 + i * beat, beat * 0.95, vol); }); }
-      else end = voiceLine(play.notes.map((m, i) => ({ midi: m, t: i * beat, dur: beat })), { at, vowel: play.vowel || opt.vowel, volume: vol, detached: play.detached });
+      if (timbre === 'piano') { play.notes.forEach((m, i) => { end = pianoNote(m, at + 0.03 + i * beat, beat * (play.detached ? 0.6 : 0.95), vol); }); }
+      else end = voiceLine(play.notes.map((m, i) => ({ midi: m, t: i * beat, dur: beat })), { at, vowel, volume: vol, detached: play.detached });
     } else if (play.kind === 'glide' || play.kind === 'glide-loop') {
       const dur = play.dur || 5, reps = play.kind === 'glide-loop' ? Math.max(1, Math.floor((opt.loopFor || dur) / (dur + 1))) : 1;
-      for (let r = 0; r < reps; r++) {
-        const t0 = at + r * (dur + 1);
-        const osc = ctx.createOscillator(), g = ctx.createGain();
-        const vowel = A.vowelOf(play.vowel || 'ou');
-        osc.setPeriodicWave(voiceWave(A.midiToHz((play.from + play.to) / 2), vowel));
-        osc.frequency.setValueAtTime(A.midiToHz(play.from), t0);
-        osc.frequency.exponentialRampToValueAtTime(A.midiToHz(play.to), t0 + dur / 2);
-        osc.frequency.exponentialRampToValueAtTime(A.midiToHz(play.from), t0 + dur);
-        const v = play.kind === 'glide-loop' ? vol * 0.45 : vol;
-        g.gain.setValueAtTime(0.0001, t0); g.gain.linearRampToValueAtTime(v, t0 + 0.15);
-        g.gain.setValueAtTime(v, t0 + dur - 0.2); g.gain.linearRampToValueAtTime(0.0001, t0 + dur);
-        osc.connect(g); g.connect(master); osc.start(t0); osc.stop(t0 + dur + 0.05);
-        track([osc], t0 + dur);
-        end = t0 + dur;
-      }
+      for (let r = 0; r < reps; r++) end = voiceGlide(play.from, play.to, dur, { at: at + 0.03 + r * (dur + 1), vowel: play.vowel || 'ou', volume: play.kind === 'glide-loop' ? vol * 0.6 : vol, oneWay: play.oneWay });
     } else if (play.kind === 'drone') {
-      end = voiceLine([{ midi: play.midi, t: 0, dur: play.dur || 4 }], { at, vowel: 'ng', volume: vol * 0.35, straight: true });
+      end = voiceLine([{ midi: play.midi, t: 0, dur: play.dur || 4 }], { at, vowel: 'ng', volume: vol * 0.35 });
     }
     return end;
   }
@@ -3213,8 +3488,10 @@ window.TB = window.TB || {}; TB.VERSION = "1.0 · 2026-09-26";
     if (ctx.state !== 'running') return false;
     const f = pcm instanceof Int16Array ? Float32Array.from(pcm, v => v / 32768) : pcm;
     const buf = ctx.createBuffer(1, f.length, sr); buf.copyToChannel ? buf.copyToChannel(f, 0) : buf.getChannelData(0).set(f);
-    const s = ctx.createBufferSource(), g = ctx.createGain(); g.gain.value = 1;
-    s.buffer = buf; s.connect(g); g.connect(master); s.start();
+    // ta prise, normalisée (crête à 0,9) puis réglée par le volume, passe par le limiteur doux mais pas par le gain des modèles
+    let pk = 0; for (let i = 0; i < f.length; i++) pk = Math.max(pk, Math.abs(f[i]));
+    const s = ctx.createBufferSource(), g = ctx.createGain(); g.gain.value = (pk > 1e-4 ? 0.9 / pk : 1) * 4 * Math.min(1.6, A.userVolume) * 0.3;
+    s.buffer = buf; s.connect(g); g.connect(bus); s.start();
     track([s], ctx.currentTime + buf.duration);
     // fin sur « ended » ou, à défaut (contexte suspendu en cours de route), sur la durée du clip
     return new Promise(res => { let done = false; const fin = () => { if (!done) { done = true; res(true); } }; s.onended = fin; setTimeout(fin, buf.duration * 1000 + 400); });
@@ -3531,6 +3808,7 @@ window.TB = window.TB || {}; TB.VERSION = "1.0 · 2026-09-26";
     if (R) return;
     U.resetAbort();
     A.tuning = S().profile.tuning || 440;
+    A.setUserVolume(S().profile.volume || 1);
     el = document.createElement('div'); el.className = 'sess'; el.setAttribute('role', 'dialog'); el.setAttribute('aria-label', 'Séance');
     document.body.appendChild(el); document.body.style.overflow = 'hidden';
     const sess = resume ? resume.sess : St.startSession(S(), plan);
@@ -3608,7 +3886,7 @@ window.TB = window.TB || {}; TB.VERSION = "1.0 · 2026-09-26";
 
   /* ------------------------------------------------------------ guidé (échauffement, détente, imagerie) */
   async function runGuided(ex, item) {
-    const st = ex.steps({ sec: item.sec })[0];
+    const st = ex.steps({ sec: item.sec }, St.ctx(S(), R.plan))[0];
     let muted = false;
     const total = item.sec, t0 = Date.now();
     const how = ex.how.map(h => `<li>${U.esc(h)}</li>`).join('');
@@ -3738,23 +4016,42 @@ window.TB = window.TB || {}; TB.VERSION = "1.0 · 2026-09-26";
     if (!r) return null;
     const o = {};
     for (const k of ['ok', 'issues', 'err', 'success', 'score', 'meanAbs', 'bias', 'missed', 'octave', 'seconds', 'mpt', 'lo', 'hi', 'center', 'voiceMidi', 'threshold', 'pc']) if (r[k] !== undefined) o[k] = r[k];
-    if (r.voice) o.voice = { cpps: r.voice.cpps, h1h2: r.voice.h1h2, brilliance: r.voice.brilliance };
+    if (r.voice) o.voice = { cpps: r.voice.cpps, h1h2: r.voice.h1h2, brilliance: r.voice.brilliance, levelDb: r.voice.levelDb };
+    if (r.quality && isFinite(r.quality.snr)) o.snr = +r.quality.snr.toFixed(1);
     if (r.notes) o.notes = r.notes.map(n => ({ i: n.i, target: n.target, err: n.err, missed: n.missed, wrong: n.wrong, center: n.center }));
     return o;
   }
 
   /* ------------------------------------------------------------ étapes */
+  /** Première note d'un modèle. */
+  const firstMidi = play => (play.kind === 'note' ? play.midi : play.kind === 'seq' ? play.notes[0] : play.kind === 'glide' || play.kind === 'glide-loop' ? play.from : null);
+  /** Réglage du volume pendant l'écoute (le son est un peu bas sur iPhone quand le micro est ouvert). */
+  const volRow = () => `<div class="row" style="justify-content:center;gap:8px">${btn('vol', '🔉 −', 'small ghost', '-0.25')}<span class="small muted">Volume ${Math.round(100 * (S().profile.volume || 1))} %</span>${btn('vol', '🔊 +', 'small ghost', '0.25')}</div>`;
+  function stepVolume(delta) {
+    const p = S().profile;
+    p.volume = Math.max(0.5, Math.min(2, Math.round(((p.volume || 1) + delta) * 100) / 100));
+    A.setUserVolume(p.volume); save();
+  }
   async function stepListen(st, params, head, okLabel) {
     const timbre = S().profile.timbre === 'piano' ? 'piano' : 'voix';
+    const opt = () => ({ timbre: st.play.timbre || timbre, vowel: st.vowel || params.vowel });
+    // dans un bloc, une note de départ éloignée de la précédente est annoncée : sinon on la compare
+    // naturellement à l'exemple d'avant, et elle « sonne faux »
+    const fm = st.noReplay ? null : firstMidi(st.play);
+    const moved = fm != null && R.block && R.block.lastRef != null && Math.abs(fm - R.block.lastRef) >= 3;
+    if (fm != null && R.block) R.block.lastRef = fm;
     await ensureSound(head);
-    frame(stage(st.label || 'Écoute', 'Écoute une fois, attentivement.', '<div class="pulse"></div>'), '', head);
-    await A.play(st.play, { timbre: st.play.timbre || timbre, vowel: st.vowel || params.vowel });
-    frame(stage(st.label || 'Écoute', 'Prêt ?', '<div class="pulse" style="animation:none;opacity:.5"></div>'), btn('listen-ok', okLabel || 'À moi', 'primary big block') + btn('replay-model', 'Réécouter', 'ghost block'), head);
+    frame(stage(st.label || 'Écoute', moved ? 'Nouvelle note de départ : oublie la précédente.' : 'Écoute une fois, attentivement.', '<div class="pulse"></div>'), '', head);
+    await A.play(st.play, opt());
+    const ready = () => frame(stage(st.label || 'Écoute', moved ? 'Prêt ? (nouvelle note de départ)' : 'Prêt ?', '<div class="pulse" style="animation:none;opacity:.5"></div>'),
+      btn('listen-ok', okLabel || 'À moi', 'primary big block') + (st.noReplay ? '' : btn('replay-model', 'Réécouter', 'ghost block')) + volRow(), head);
+    ready();
     for (;;) {
-      const a = await U.wait(['listen-ok', 'replay-model']);
+      const a = await U.wait(['listen-ok', 'replay-model', 'vol']);
       if (a.act === 'listen-ok') return;
-      if (!A.running()) { await ensureSound(head); frame(stage(st.label || 'Écoute', 'Prêt ?', '<div class="pulse" style="animation:none;opacity:.5"></div>'), btn('listen-ok', okLabel || 'À moi', 'primary big block') + btn('replay-model', 'Réécouter', 'ghost block'), head); }
-      await A.play(st.play, { timbre: st.play.timbre || timbre, vowel: st.vowel || params.vowel });
+      if (a.act === 'vol') { stepVolume(+a.arg); ready(); continue; }
+      if (!A.running()) { await ensureSound(head); ready(); }
+      await A.play(st.play, opt());
     }
   }
 
@@ -3848,7 +4145,7 @@ window.TB = window.TB || {}; TB.VERSION = "1.0 · 2026-09-26";
     frame(stage('Analyse…', '', '<div class="pulse"></div>'), '', head);
     await U.frame();
     let res = null;
-    try { res = D.analyzeTake(pcm, sr, spec); } catch (e) { console.error(e); res = null; }
+    try { res = D.analyzeTake(pcm, sr, Object.assign({ a4: A.tuning }, spec)); } catch (e) { console.error(e); res = null; }
     R.lastRec = { pcm, sr };
     return { res, pcm, sr };
   }
@@ -3866,37 +4163,33 @@ window.TB = window.TB || {}; TB.VERSION = "1.0 · 2026-09-26";
 
   /* ------------------------------------------------------------ oreille fine (quiz) */
   async function runDiscri(st, head) {
-    let cents = st.start, streak = 0, last = null, correct = 0;
-    const revs = [], hist = [];
+    // estimation bayésienne adaptative du seuil (ZEST) : chaque écart est placé là où la mesure est la plus
+    // informative ; voyelle « a », riche en harmoniques, pour une hauteur bien nette
+    const z = C.zest.init(st.start || 30, 0.8), pair = (base, up, cents) => ({ a: { kind: 'note', midi: base, dur: 0.8 }, b: { kind: 'note', midi: base + (up ? 1 : -1) * cents / 100, dur: 0.8 } });
+    const playPair = async q => { await A.play(q.a, { timbre: 'voix', vowel: 'a' }); await U.sleep(250); await A.play(q.b, { timbre: 'voix', vowel: 'a' }); };
     for (let i = 0; i < st.trials; i++) {
+      const cents = C.zest.next(z);
       const base = st.note + Math.floor(Math.random() * 7) - 3;
-      const up = Math.random() < 0.5;
+      const up = Math.random() < 0.5, q = pair(base, up, cents);
       await ensureSound(head);
-      frame(stage('Écoute les deux sons', 'Essai ' + (i + 1) + '/' + st.trials + ' · écart actuel ' + Math.round(cents) + ' cents', '<div class="pulse"></div>'), '', head);
+      frame(stage('Écoute les deux sons', 'Essai ' + (i + 1) + '/' + st.trials + ' · écart ' + Math.round(cents) + ' cents', '<div class="pulse"></div>'), '', head);
       await U.sleep(300);
-      await A.play({ kind: 'note', midi: base, dur: 0.8, straight: true }, { timbre: 'voix', vowel: 'ou' });
-      await U.sleep(250);
-      await A.play({ kind: 'note', midi: base + (up ? 1 : -1) * cents / 100, dur: 0.8, straight: true }, { timbre: 'voix', vowel: 'ou' });
+      await playPair(q);
       frame(stage('Le 2ᵉ son était…', 'Essai ' + (i + 1) + '/' + st.trials), `<div class="predict">${btn('q-ans', '▲ Plus haut', 'big', 'up')}${btn('q-ans', '▼ Plus bas', 'big', 'down')}</div>` + btn('q-replay', 'Réécouter', 'ghost small'), head);
       let a;
       for (;;) {
         a = await U.wait(['q-ans', 'q-replay']);
         if (a.act === 'q-ans') break;
         await ensureSound(head);
-        await A.play({ kind: 'note', midi: base, dur: 0.8, straight: true }, { timbre: 'voix', vowel: 'ou' }); await U.sleep(250);
-        await A.play({ kind: 'note', midi: base + (up ? 1 : -1) * cents / 100, dur: 0.8, straight: true }, { timbre: 'voix', vowel: 'ou' });
+        await playPair(q);
       }
       const ok = (a.arg === 'up') === up;
-      hist.push({ cents, ok }); if (ok) correct++;
+      C.zest.update(z, cents, ok);
       frame(stage(ok ? '✓ Oui' : '✗ Non', ok ? '' : 'C’était ' + (up ? 'plus haut' : 'plus bas') + '.'), '', head);
       await U.sleep(650);
-      // escalier 2 bonnes → plus fin ; 1 erreur → plus large
-      const dir = ok ? (++streak >= 2 ? -1 : 0) : 1;
-      if (dir !== 0) { if (last != null && dir !== last) revs.push(cents); last = dir; streak = 0; cents = Math.max(4, Math.min(150, dir < 0 ? cents / 1.41 : cents * 1.41)); }
     }
-    const tail = revs.length >= 3 ? revs.slice(-4) : hist.slice(-6).map(h => h.cents);
-    const threshold = Math.exp(tail.reduce((s, v) => s + Math.log(v), 0) / tail.length);
-    return { threshold, pc: correct / st.trials, correct, n: st.trials };
+    const est = C.zest.estimate(z);
+    return { threshold: est.threshold, lo80: est.lo80, hi80: est.hi80, correct: est.correct, n: est.n, pc: est.correct / Math.max(1, est.n) };
   }
 
   /* ------------------------------------------------------------ chanson */
@@ -3933,7 +4226,7 @@ window.TB = window.TB || {}; TB.VERSION = "1.0 · 2026-09-26";
       if (R.hidden !== hid0) U.toast('L’enregistrement a été coupé (écran verrouillé ou app quittée).', 3500);
       if (pcm.length >= sr * 0.5) {
         frame(stage('Analyse…', '', '<div class="pulse"></div>'), '', head); await U.frame();
-        try { res = D.analyzeTake(pcm, sr, st.rec.spec); } catch (e) { res = null; }
+        try { res = D.analyzeTake(pcm, sr, Object.assign({ a4: A.tuning }, st.rec.spec)); } catch (e) { res = null; }
         try { const x16 = D.resample(pcm, sr, 16000); await Store.saveRec(x16, { ex: ex.id, kind: 'song', song: song.id, label: song.title + (st.pressure ? ' · simulation' : '') }); if (U.invalidateRecs) U.invalidateRecs(); } catch (e) { /* stockage plein */ }
       } else pcm = null;
     } else {
@@ -4175,7 +4468,7 @@ window.TB = window.TB || {}; TB.VERSION = "1.0 · 2026-09-26";
     if (plan.type === 'R' && plan.minutes === 0) return `<div class="card"><h2>${esc(plan.title)}</h2>${plan.notes.map(n => `<p class="notice bad" style="margin-top:10px">${esc(n)}</p>`).join('')}<div class="row" style="margin-top:12px">${btn('ck-reset', 'Modifier ma réponse', 'ghost')}</div></div>`;
     const typeName = { T: 'Registres & son', J: 'Justesse & oreille', A: 'Application', B: 'Bilan', R: 'Récupération', jourJ: 'Jour J', veille: 'Veille' }[plan.type] || plan.type;
     const rows = plan.items.map(it => {
-      if (it.mix) return `<div class="row between small"><span>Mélange justesse (tenue · écho · intervalle)</span><span class="faint">${it.takes} prises</span></div>`;
+      if (it.mix) return `<div class="row between small"><span>${esc(it.ex ? it.label : 'Mélange justesse (tenue · écho · intervalle)')}</span><span class="faint">${it.takes} prises</span></div>`;
       const ex = C.EX[it.ex];
       const n = it.sec && !it.takes ? Math.round(it.sec / 60 * 10) / 10 + ' min' : it.fixed ? it.fixed.length + ' prises' : it.ladder ? 'échelle' : it.takes + (it.takes > 1 ? ' prises' : ' prise');
       return `<div class="row between small"><span>${esc(ex.name)}${it.isNew ? ' <span class="tag accent">nouveau</span>' : ''}</span><span class="faint">${n}</span></div>`;
@@ -4241,7 +4534,8 @@ window.TB = window.TB || {}; TB.VERSION = "1.0 · 2026-09-26";
     h += block('« Ssss » régulier', 'hiss', 's', { minSpan: 4 });
     if (ser.vfe && ser.vfe.length) h += block('Tenue « i » (protocole VFE)', 'vfe', 's', { minSpan: 4, help: 'Dans VOIX (juillet) : 22,6 à 27,5 s, moyenne ≈ 24,8 s.' });
     h += block('Sommet de sirène sans cassure', 'hi', '', { minSpan: 2, fmt: v => nn(v) });
-    h += block('Densité : chanté (CPPS)', 'singCpps', 'dB', { minSpan: 2, color: 'var(--accent2)', help: 'Mesuré dans « Du parlé au chanté ». Plus haut = son plus timbré, moins d’air. À comparer à ta voix parlée : ' + (ser.speechCpps && ser.speechCpps.length ? fr(ser.speechCpps[ser.speechCpps.length - 1][1]) + ' dB.' : '—') });
+    h += block('Densité : chanté vs « a ! » parlé', 'pcGap', 'dB', { minSpan: 2, color: 'var(--accent2)', help: 'Mesuré dans « Du parlé au chanté », à même voyelle et même hauteur. 0 = aussi dense chanté que parlé ; sous −2 dB, de l’air se perd en chantant.' });
+    if (ser.jnd && ser.jnd.length) h += block('Seuil d’oreille', 'jnd', 'c', { minSpan: 4, color: 'var(--info)', help: 'Plus petit écart de hauteur que tu entends (75 % de bonnes réponses). Plus bas = oreille plus fine.' });
     if (ser.stress && ser.stress.length) h += block('Stress en simulation', 'stress', '/5', { minSpan: 2, color: 'var(--warn)', help: 'La pression apprivoisée baisse ce chiffre au fil des simulations.' });
     if (s.bilans.length) {
       h += `<div class="card"><h3>Bilans</h3><table class="t" style="margin-top:8px"><tr><th>Date</th><th>Type</th><th class="n">Global</th></tr>${s.bilans.map(b => `<tr><td>${esc(U.dateFr(b.date))}</td><td>${b.kind === 'entree' ? 'Entrée' : 'S' + b.week}</td><td class="n"><b>${fr(b.overall)}</b></td></tr>`).join('')}</table></div>`;
@@ -4332,10 +4626,13 @@ window.TB = window.TB || {}; TB.VERSION = "1.0 · 2026-09-26";
       <p class="tiny faint">Notation : La4 = 440 Hz (le La du diapason), Do4 = do du milieu du piano.</p></div></div>`;
     h += `<div class="card"><h3>Séances</h3><div class="col" style="margin-top:10px"><label class="field">Durée habituelle<select data-change="prof-num" data-arg="sessionMin">${[10, 15, 20, 25, 30, 40, 50].map(v => `<option value="${v}" ${p.sessionMin === v ? 'selected' : ''}>${v} min</option>`).join('')}</select></label><label class="field">Séances par semaine<select data-change="prof-num" data-arg="daysPerWeek">${[3, 4, 5, 6].map(v => `<option value="${v}" ${p.daysPerWeek === v ? 'selected' : ''}>${v}</option>`).join('')}</select></label></div></div>`;
     h += `<div class="card"><h3>Son et micro</h3>${sw('mic', 'Utiliser le micro', 'Mesure justesse, densité, cassures. Sans micro : auto-évaluation.')}${sw('predict', 'Deviner avant de voir', 'Entraîne ton oreille interne (recommandé).')}
+      <label class="field" style="margin-top:6px">Volume des modèles : ${Math.round(100 * (p.volume || 1))} %<input type="range" min="50" max="200" step="10" value="${Math.round(100 * (p.volume || 1))}" data-change="prof-volume" aria-label="Volume des modèles"></label>
+      <p class="tiny faint">Micro ouvert, l’iPhone joue plus bas : monte ici (ou avec 🔊 pendant l’écoute) et pense aux boutons de volume du téléphone.</p>
       <label class="field" style="margin-top:6px">Son du modèle<select data-change="prof-timbre"><option value="voix" ${p.timbre !== 'piano' ? 'selected' : ''}>Voix (on imite mieux une voix)</option><option value="piano" ${p.timbre === 'piano' ? 'selected' : ''}>Piano</option></select></label>
       <label class="field" style="margin-top:6px">Diapason<select data-change="prof-num" data-arg="tuning">${[440, 441, 442, 443].map(v => `<option value="${v}" ${p.tuning === v ? 'selected' : ''}>La = ${v} Hz</option>`).join('')}</select></label>
-      <p class="tiny faint" style="margin-top:10px">Pour des mesures fiables : pièce calme, téléphone à 30–50 cm, et toujours le même micro d’une séance à l’autre (la densité se compare à toi-même). Avec des écouteurs Bluetooth, iOS peut passer en mode « appel » : son dégradé, micro des écouteurs.</p>
-      <div style="margin-top:10px">${btn('mic-test', 'Tester le micro', 'small')}</div></div>`;
+      <p class="tiny faint" style="margin-top:10px">Pour des mesures fiables : pièce calme, téléphone à 30–50 cm, et toujours le même micro d’une séance à l’autre (la densité se compare à toi-même). Avec des écouteurs Bluetooth, iOS peut passer en mode « appel » : son dégradé, micro des écouteurs. Sur le haut-parleur du téléphone, les notes très graves sont moins nettes qu’avec des écouteurs filaires.</p>
+      <div class="row wrap" style="margin-top:10px">${btn('vol-test', '▶ Écouter le modèle', 'small')}${btn('mic-test', 'Tester le micro', 'small')}${btn('loop-test', 'Vérifier la justesse du son', 'small')}</div>
+      ${loopMsg ? `<p class="small" style="margin-top:8px">${esc(loopMsg)}</p>` : ''}</div>`;
     h += `<div class="card"><h3>Apparence</h3><div class="chips" style="margin-top:8px">${[['auto', 'Automatique'], ['dark', 'Sombre'], ['light', 'Clair']].map(([v, l]) => `<button class="chip ${(s.theme || 'auto') === v ? 'on' : ''}" data-act="theme" data-arg="${v}">${l}</button>`).join('')}</div></div>`;
     h += `<div class="card"><h3>Données</h3><p class="small muted" style="margin:4px 0 10px">Tout reste sur ce téléphone. Exporte régulièrement (et avant de changer de téléphone ou de vider Safari). Ajoute TIMBRE à l’écran d’accueil pour que Safari garde les données.</p><div class="col">${btn('export', 'Exporter mes données', '')}<label class="btn">Importer (TIMBRE ou VOIX)<input type="file" accept=".json,.txt,application/json,text/plain" data-change="import-file" style="display:none"></label>${btn('reset', 'Tout réinitialiser', 'ghost small')}</div></div>`;
     h += `<div class="card flat">${btn('tab', 'Comment ça marche · sources scientifiques', 'block', 'science')}</div>`;
@@ -4352,6 +4649,40 @@ window.TB = window.TB || {}; TB.VERSION = "1.0 · 2026-09-26";
   U.on('prof-num', (v, el) => { S().profile[el.dataset.arg] = +v; save(); });
   U.on('prof-bool', (v, el) => { S().profile[el.dataset.arg] = !!v; save(); });
   U.on('prof-timbre', v => { S().profile.timbre = v; save(); });
+  U.on('prof-volume', v => { const p = S().profile; p.volume = Math.max(0.5, Math.min(2, +v / 100)); A.setUserVolume(p.volume); save(); U.render(); });
+  U.on('vol-test', async () => {
+    const p = S().profile; A.setUserVolume(p.volume || 1);
+    try { await A.play({ kind: 'seq', notes: [0, 4, 7, 4, 0].map(x => p.comfortLow + 5 + x), tempo: 100 }, { timbre: p.timbre === 'piano' ? 'piano' : 'voix', vowel: 'a' }); } catch (e) { U.toast('Audio indisponible.'); }
+  });
+  /**
+   * Vérification de bout en bout : le téléphone joue deux notes du modèle et les réécoute au micro. Si la
+   * hauteur mesurée s'écarte de plus de 10 cents, le son est décalé (écouteurs Bluetooth en mode « appel »,
+   * fréquence d'échantillonnage changée par iOS…) : on le dit, plutôt que de laisser croire à une fausse note.
+   */
+  let loopMsg = '';
+  U.on('loop-test', async () => {
+    const p = S().profile, notes = [p.comfortLow + 5, p.comfortLow + 12];
+    try {
+      A.tuning = p.tuning || 440; A.setUserVolume(Math.max(1, p.volume || 1));
+      U.toast('Vérification : pose le téléphone, sans écouteurs, et reste silencieux 5 s…', 5000);
+      await A.openMic(); A.startRec(); await U.sleep(600);
+      for (const m of notes) { await A.play({ kind: 'note', midi: m, dur: 1.4 }, { timbre: 'voix', vowel: 'a' }); await U.sleep(300); }
+      await U.sleep(300);
+      const { pcm, sr } = A.stopRec(); A.closeMic();
+      const res = D.analyzeTake(pcm, sr, { type: 'notes', targets: notes.map(m => ({ midi: m, dur: 1.4 })), tol: 10, a4: p.tuning || 440 });
+      const errs = (res.notes || []).filter(n => !n.missed && isFinite(n.err)).map(n => n.err);
+      if (!res.ok || errs.length < 2) loopMsg = 'Je n’entends pas le haut-parleur : monte le volume, retire les écouteurs, et autorise le micro.';
+      else {
+        const worst = errs.reduce((a, b) => (Math.abs(b) > Math.abs(a) ? b : a), 0), oct = res.octave;
+        loopMsg = oct ? 'Hauteur entendue à l’octave : le haut-parleur rend mal ces notes graves. Des écouteurs filaires seront plus nets.'
+          : Math.abs(worst) <= 10 ? 'Son juste ✓ — les modèles arrivent à ' + Math.round(Math.abs(worst)) + ' cent(s) près.'
+          : 'Son décalé de ' + Math.round(worst) + ' cents : ferme et relance Safari, évite les écouteurs Bluetooth, puis refais la vérification.';
+      }
+    } catch (e) { loopMsg = 'Vérification impossible : micro refusé ou indisponible.'; try { A.closeMic(); } catch (x) { /* rien */ } }
+    A.setUserVolume(p.volume || 1);
+    if (screen === 'settings') U.render();
+    U.toast(loopMsg, 5000);
+  });
   U.on('theme', v => { S().theme = v; applyTheme(); save(); U.render(); });
   function applyTheme() { const t = S().theme || 'auto'; if (t === 'auto') document.documentElement.removeAttribute('data-theme'); else document.documentElement.setAttribute('data-theme', t); }
   U.applyTheme = applyTheme;
@@ -4410,10 +4741,18 @@ window.TB = window.TB || {}; TB.VERSION = "1.0 · 2026-09-26";
     ['Carter & Grahn (2016). Optimizing music learning: exploring how blocked and interleaved practice schedules affect advanced performance. Frontiers in Psychology 7:1251.', 'Blocs mélangés (entraînement alterné).'],
     ['Salmoni, Schmidt & Walter (1984). Knowledge of results and motor learning: a review and critical reappraisal. Psychological Bulletin 95(3).', 'Retour après la prise, pas pendant (hypothèse du guidage).'],
     ['Guadagnoli & Kohl (2001). Knowledge of results for motor learning: relationship between error estimation and knowledge of results frequency. Journal of Motor Behavior 33(2).', '« Deviner avant de voir » : estimer son erreur avant le résultat.'],
-    ['Hutchins & Peretz (2012). A frog in your throat or in your ear? Searching for the causes of poor singing. Journal of Experimental Psychology: General 141(1).', 'On imite mieux un modèle au timbre vocal : modèle « voix » par défaut.'],
+    ['Hutchins & Peretz (2012). A frog in your throat or in your ear? Searching for the causes of poor singing. Journal of Experimental Psychology: General 141(1).', 'On imite mieux une voix (surtout la sienne) qu’un timbre de synthèse : modèle « voix » par défaut.'],
+    ['Yarbrough, Bowers & Benson (1992). The effect of vibrato on the pitch-matching accuracy of certain and uncertain singers. Journal of Research in Music Education 40(1).', 'Modèles sans vibrato : plus justes à imiter quand on doute de sa justesse.'],
+    ['Shonle & Horan (1980). The pitch of vibrato tones. JASA 67(1).', 'La hauteur perçue d’un vibrato est sa moyenne : une tenue vibrée est jugée sur son centre.'],
+    ['Russo & Thompson (2005). An interval size illusion: the influence of timbre on the perceived size of melodic intervals. Perception & Psychophysics 67(4).', 'Un timbre qui change fausse les intervalles perçus : formants fixes pour la voix-modèle.'],
+    ['Schneider et al. (2005). Structural and functional asymmetry of lateral Heschl’s gyrus reflects pitch perception preference. Nature Neuroscience 8.', 'Hauteur « spectrale » vs fondamentale : harmoniques graves renforcées pour le haut-parleur.'],
+    ['King-Smith et al. (1994). Efficient and unbiased modifications of the QUEST threshold method. Vision Research 34(7).', 'Oreille fine : estimation bayésienne adaptative (ZEST) du seuil.'],
+    ['Deliyski, Shaw & Evans (2005). Adverse effects of environmental noise on acoustic voice quality measurements. Journal of Voice 19(1).', 'Densité jugée seulement si le bruit est ≥ 30 dB sous la voix.'],
+    ['Brockmann-Bauser et al. (2021). Effects of vocal intensity and fundamental frequency on cepstral peak prominence. Journal of Voice 35(3).', 'Le CPPS dépend du volume et de la hauteur : comparaisons à conditions égales.'],
+    ['Shea & Morgan (1979). Contextual interference effects on the acquisition, retention, and transfer of a motor skill. JEP: Human Learning and Memory 5(2).', 'Alterner les exercices connus fait mieux retenir que les répéter en bloc.'],
     ['Larrouy-Maestri (2018). « I know it when I hear it »: on listeners’ perception of mistuning. Music & Science 1.', 'Seuils de justesse perçue (≈ 10–25 cents).'],
     ['Hillenbrand & Houde (1996). Acoustic correlates of breathy vocal quality. Journal of Speech and Hearing Research 39(2).', 'CPPS : mesure de référence du souffle dans la voix.'],
-    ['Maryn & Weenink (2015). Objective dysphonia measures in the program Praat: smoothed cepstral peak prominence and acoustic voice quality index. Journal of Voice 29(1).', 'Notre CPPS reproduit celui de Praat (écart médian 0,4 dB).'],
+    ['Maryn & Weenink (2015). Objective dysphonia measures in the program Praat: smoothed cepstral peak prominence and acoustic voice quality index. Journal of Voice 29(1).', 'Notre CPPS reproduit celui de Praat (écart médian < 1 dB).'],
     ['Titze (2006). Voice training and therapy with a semi-occluded vocal tract: rationale and scientific underpinnings. JSLHR 49(2).', 'Paille, trilles, « ng » : échauffement et récupération.'],
     ['Angadi, Croake & Stemple (2019). Effects of vocal function exercises: a systematic review. Journal of Voice 33(1).', 'Exercices de fonction vocale, régularité.'],
     ['Oudejans & Pijpers (2009). Training with anxiety has a positive effect on expert perceptual–motor performance under pressure. Quarterly Journal of Experimental Psychology 62(8).', 'Simulations sous pression légère.'],
@@ -4426,15 +4765,16 @@ window.TB = window.TB || {}; TB.VERSION = "1.0 · 2026-09-26";
   function science() {
     let h = `<header class="topbar"><button class="iconbtn" data-act="tab" data-arg="settings" aria-label="Retour">‹</button><h1 class="grow">Comment ça marche</h1></header><section class="screen">`;
     h += `<div class="card"><h3>Ce que mesure le micro</h3><ul class="small" style="margin:8px 0 0;padding-left:18px">
-      <li><b>Justesse</b> : suivi de hauteur (corrélation normalisée + contrôle spectral des octaves + chemin le plus probable). Testé : 0 erreur d’octave sur voix réelle re-synthétisée, précision 4–7 cents, accord avec Praat sur la parole réelle.</li>
-      <li><b>Densité du son</b> : CPPS (proéminence du pic cepstral), la mesure de référence du souffle dans la voix, calculée comme Praat. Comparée à <i>ta</i> référence et à ta voix parlée.</li>
+      <li><b>Justesse</b> : suivi de hauteur (corrélation normalisée + contrôle spectral des octaves + chemin le plus probable), dans le diapason choisi. Testé : précision ±3 cents, 0 erreur d’octave, fiable même dans le bruit. Une note tenue avec vibrato est jugée sur son centre, comme l’entend l’oreille.</li>
+      <li><b>Densité du son</b> : CPPS (proéminence du pic cepstral), la mesure de référence du souffle dans la voix, calculée comme Praat (écart médian &lt; 1 dB). Elle dépend aussi de la hauteur, de la voyelle, du volume et du bruit : elle n’est comparée qu’à <i>tes</i> prises comparables (même voyelle, même zone, volume proche), et seulement si la pièce est assez calme. Dans « Du parlé au chanté », ton « a ! » parlé et ton « a » chanté sont comparés à même hauteur.</li>
       <li><b>Fermeture glottique</b> : H1–H2 (plus haut = plus d’air).</li>
       <li><b>Cassures</b> dans les sirènes, <b>attaques</b> soufflées, <b>vibrato</b> (vitesse, amplitude), <b>trous</b> dans le legato, durées de souffle.</li>
       <li>Si la voix est trop soufflée ou la pièce trop bruyante pour mesurer de façon sûre, TIMBRE le dit et ne note pas.</li></ul></div>`;
     h += `<div class="card"><h3>Comment tu progresses</h3><ul class="small" style="margin:8px 0 0;padding-left:18px">
       <li>Chaque compétence a un niveau estimé ; chaque exercice est généré pour que tu réussisses environ 4 prises sur 5.</li>
       <li>Retour après la prise (jamais pendant), bref, centré sur une chose ; parfois tu devines d’abord.</li>
-      <li>Blocs alternés, compétences revues à intervalles réguliers, bilans toutes les 4 semaines.</li>
+      <li>Un exercice nouveau se travaille d’abord en bloc ; une fois connu, il alterne avec un autre de la même compétence (mieux retenu). Compétences revues à intervalles réguliers, bilans toutes les 4 semaines (rattrapés si tu les manques).</li>
+      <li>Les modèles : voix de synthèse aux formants fixes (le même timbre seule ou dans une mélodie), sans vibrato (plus facile à imiter juste), notes graves rendues nettes sur haut-parleur. Volume réglable.</li>
       <li>Forme du jour, charge vocale, pauses et échéance ajustent la séance.</li></ul></div>`;
     h += `<div class="card"><h3>Santé vocale</h3><ul class="small" style="margin:8px 0 0;padding-left:18px"><li>Douleur en chantant : on arrête.</li><li>Enrouement qui dure plus de deux semaines : consulte un ORL ou un phoniatre.</li><li>Voix fatiguée : travail très doux (paille, bouche fermée) plutôt que forcer ou chuchoter.</li><li>Hydratation, sommeil, et pas de gros volume la veille d’une échéance.</li></ul></div>`;
     h += `<div class="card"><h3>Sources</h3><ol class="small" style="margin:8px 0 0;padding-left:18px">${U.SOURCES.map(([ref, why]) => `<li style="margin-bottom:8px">${esc(ref)}<br><span class="faint">${esc(why)}</span></li>`).join('')}</ol></div>`;
@@ -4497,6 +4837,7 @@ TB.PRESET = {"from":"2026-09-23","skills":{"oreille":{"th":5,"sd":2},"tenue":{"t
     try { s = Store.load(); } catch (e) { s = null; }
     state = s ? St.migrate(s) : St.newState();
     U.applyTheme();
+    if (TB.audio) { TB.audio.tuning = state.profile.tuning || 440; TB.audio.setUserVolume(state.profile.volume || 1); }
     let warned = false;
     Store.onError = () => { if (!warned) { warned = true; U.toast('Sauvegarde impossible (mémoire du navigateur pleine ?). Exporte tes données dans Réglages.', 6000); } };
     U.render();
