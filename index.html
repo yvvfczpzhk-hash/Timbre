@@ -182,7 +182,7 @@ table.t td.n { text-align: right; font-variant-numeric: tabular-nums; }
 <div id="app"><p style="padding:40px 20px;color:#9aa7b5">Chargement…</p></div>
 <noscript><p style="padding:20px">TIMBRE a besoin de JavaScript.</p></noscript>
 <script>
-window.TB = window.TB || {}; TB.VERSION = "1.1 · 2026-10-01";
+window.TB = window.TB || {}; TB.VERSION = "1.2 · 2026-10-10";
 
 /* ==== dsp.js ==== */
 /* ============================================================================
@@ -1287,6 +1287,42 @@ window.TB = window.TB || {}; TB.VERSION = "1.1 · 2026-10-01";
   };
 
   /**
+   * Étalonnage par exercice (Elo à deux paramètres des systèmes d'apprentissage adaptatifs : niveau de la
+   * personne + difficulté de l'item, Klinkenberg et al. 2011 ; Pelánek 2016). Chaque exercice (ou variante)
+   * apprend pour toi un décalage de difficulté b : un exercice plus dur que prévu (intervalle sans modèle,
+   * vibrato…) monte son propre b au lieu de faire chuter toute la compétence. Un exercice neuf pèse peu sur le
+   * niveau tant qu'il n'est pas étalonné (φ = n / 4, plafonné à 1) ; b revient doucement vers 0 sans preuve
+   * contraire ; un exercice hors de portée (réussite récente < 35 %) ne fait plus baisser la compétence : il
+   * s'étalonne, et le planificateur propose sa version guidée ou un autre exercice.
+   */
+  // réglages choisis sur des programmes simulés de 20 semaines (exercices bien ou mal calibrés) : erreur
+  // d'estimation divisée par 2 quand un exercice est mal calibré, inchangée sinon
+  M.CAL = { n0: 4, kb: 0.4, nb: 6, shrink: 0.02, lo: -2.5, hi: 3.5, ema: 0.25, out: 0.35, outN: 3, retryDays: 14 };
+  M.newOffset = () => ({ b: 0, n: 0, ema: 0.75, last: 0 });
+  /** Variante hors de portée : réussite récente trop basse (de nouveau proposée après 14 jours). */
+  M.outOfReach = (o, now) => !!o && o.n >= M.CAL.outN && o.ema < M.CAL.out && !(now && o.last && now - o.last > M.CAL.retryDays * 864e5);
+  /** Mise à jour d'une prise avec étalonnage de l'exercice ; renvoie la surprise transmise aux compétences secondaires. */
+  M.updateCal = function (sk, off, d, y, w, ts) {
+    w = w == null ? 1 : w;
+    const p = M.pSuccess(sk.th, d + (off ? off.b : 0)), r = y - p;
+    // hors de portée : un échec étalonne l'exercice mais ne fait plus baisser la compétence
+    const phi = !off ? 1 : r < 0 && M.outOfReach(off) ? 0 : Math.min(1, off.n / M.CAL.n0);
+    const K = (0.12 + 0.28 * Math.min(1, sk.sd / 2)) * w * phi;
+    sk.th = Math.max(0, Math.min(10, sk.th + K * r * 2));
+    sk.sd = Math.max(0.45, sk.sd * (1 - 0.02 * w * phi));
+    sk.n += w * phi;
+    stamp(sk, ts);
+    if (off) {
+      const kb = M.CAL.kb / (1 + off.n / M.CAL.nb);
+      off.b = Math.max(M.CAL.lo, Math.min(M.CAL.hi, off.b * (1 - M.CAL.shrink * w) - kb * w * r * 2));
+      off.ema += M.CAL.ema * Math.min(1, w) * (y - off.ema);
+      off.n += w;
+      if (ts) off.last = ts;
+    }
+    return { p, r: r * phi };
+  };
+
+  /**
    * Observation directe d'un niveau (mesure étalon : durée de « ssss », étendue, bilan) :
    * fusion bayésienne entre l'a priori (θ, σ) et la mesure (niveau, bruit).
    */
@@ -1430,6 +1466,12 @@ window.TB = window.TB || {}; TB.VERSION = "1.1 · 2026-10-01";
     3: 'Greensleeves (« A- las »)', 1: 'Les Dents de la mer', 10: 'Star Trek (thème)',
   };
   const IV_COST = { 12: 1.2, 7: 1.5, 2: 2.0, 5: 2.2, 4: 2.4, 3: 2.9, 9: 3.2, 1: 3.5, 8: 3.8, 10: 4.0, 11: 4.5, 6: 4.8 };
+  /**
+   * Registre déclaré d'une note aiguë. L'aigu se travaille en voix mixte : une note juste mais tenue en voix de
+   * tête (légère, flûtée) compte « presque » (0,5), « je ne sais pas » 0,75. Ainsi le niveau d'aigu redescend
+   * vers la hauteur où ta voix mixte tient vraiment, et l'échelle du bilan s'arrête là où elle bascule.
+   */
+  C.REG_CAP = { mixte: 1, tete: 0.5, '?': 0.75 };
   /** Nom d'intervalle avec article : « la quinte », « le triton », « l’octave » ; « une quinte », « un triton ». */
   C.ivDef = iv => (iv === 6 ? 'le ' : iv === 12 ? 'l’' : 'la ') + C.IV_NAMES[iv];
   C.ivIndef = iv => (iv === 6 ? 'un ' : 'une ') + C.IV_NAMES[iv];
@@ -1538,20 +1580,43 @@ window.TB = window.TB || {}; TB.VERSION = "1.1 · 2026-10-01";
     return q;
   };
 
-  /** Choix des paramètres : parmi des candidats, celui dont la difficulté est la plus proche de la cible. */
+  /**
+   * Choix des paramètres : parmi des candidats, celui dont la difficulté effective (difficulté prévue + décalage
+   * appris pour toi sur cet exercice ou cette variante) est la plus proche de la cible. Les variantes hors de
+   * portée sont écartées tant qu'il en reste d'autres (ex. : intervalle sans modèle → avec modèle).
+   */
   C.choose = function (ex, target, ctx, r) {
     let cands = ex.candidates(ctx, r);
     // après « ça forçait » : rien au-dessus du plafond (s'il reste des candidats)
     if (isFinite(ctx.maxNote)) { const low = cands.filter(p => !(C.topOf(p) > ctx.maxNote)); if (low.length) cands = low; }
+    const offs = ctx.offsets || {}, key = p => (ex.calKey ? ex.calKey(p) : ex.id), memo = {};
+    const eff = k => memo[k] || (memo[k] = C.effOffset(ex, k, offs, ctx.now));
+    let scored = cands.map(p => { const e = eff(key(p)); return { p, d: ex.difficulty(p, ctx), b: e.b, out: e.out }; }).filter(o => isFinite(o.d));
+    const reach = scored.filter(o => !o.out);
+    if (reach.length) scored = reach;
     let best = null, bd = Infinity;
-    const scored = cands.map(p => ({ p, d: ex.difficulty(p, ctx) })).filter(o => isFinite(o.d));
-    for (const o of scored) { const e = Math.abs(o.d - target); if (e < bd) { bd = e; best = o; } }
+    for (const o of scored) { const e = Math.abs(o.d + o.b - target); if (e < bd) { bd = e; best = o; } }
     if (!best) return null;
     // un peu de variété : tirage parmi les candidats à moins de 0,35 du meilleur écart
-    const near = scored.filter(o => Math.abs(o.d - target) <= bd + 0.35);
+    const near = scored.filter(o => Math.abs(o.d + o.b - target) <= bd + 0.35);
     const o = near.length ? near[Math.floor((r || Math.random)() * near.length) % near.length] : best;
     return { params: o.p, d: o.d };
   };
+  /**
+   * Décalage effectif d'une variante : le sien, mais jamais moins que celui de la variante qui la précède
+   * (une variante plus exigeante n'est pas plus facile pour toi) ; hors de portée si la précédente l'est.
+   */
+  C.effOffset = function (ex, key, offsets, now) {
+    let b = -Infinity, out = false, k = key, guard = 0;
+    while (k && guard++ < 5) {
+      const o = (offsets || {})[k];
+      if (o) { b = Math.max(b, o.b); out = out || M.outOfReach(o, now); }
+      k = ex.calPrereq ? ex.calPrereq[k] : null;
+    }
+    return { b: isFinite(b) ? b : 0, out };
+  };
+  /** Toutes les variantes d'un exercice sont-elles hors de portée pour toi ? */
+  C.allOutOfReach = (ex, offsets, now) => (ex.calKeys || [ex.id]).every(k => C.effOffset(ex, k, offsets, now).out);
 
   /** Notes d'entraînement utilisables selon le profil et la forme du jour. */
   function noteRange(ctx, extraTop) {
@@ -1707,29 +1772,42 @@ window.TB = window.TB || {}; TB.VERSION = "1.1 · 2026-10-01";
 
   EX.push({
     id: 'intervalle', name: 'Intervalle chanté', comp: 'melodie', also: { oreille: 0.5 }, kind: 'sing', load: 0.6, pillar: 'justesse',
-    why: 'Chanter un intervalle sans l’entendre d’abord : c’est l’oreille « intérieure » qui guide la voix, comme dans une chanson.',
-    how: ['Écoute la note de départ.', 'Chante-la, puis l’intervalle demandé (sans modèle).', 'Aide : pense au début de la chanson indiquée.'],
+    why: 'Chanter un intervalle d’après son nom : c’est l’oreille « intérieure » qui guide la voix, comme dans une chanson. On l’apprend en retirant les aides une à une : d’abord en l’écoutant, puis avec la seule note de départ, enfin avec le nom seul (guidage dégressif).',
+    how: ['Écoute la note de départ (au début, l’intervalle entier).', 'Chante la note, puis l’intervalle demandé.', 'Aide : pense au début de la chanson indiquée ; plus tard, le nom seul suffira.'],
     cue: 'Entends la 2e note dans ta tête avant de la chanter.',
+    // trois variantes, chacune étalonnée pour toi : avec modèle → note de départ (+ chanson-aide) → nom seul
+    modes: ['modele', 'depart', 'nom'],
+    calKey: p => 'intervalle' + (p.mode && p.mode !== 'depart' ? ':' + p.mode : ''),
+    calKeys: ['intervalle:modele', 'intervalle', 'intervalle:nom'],
+    // chaque variante est au moins aussi difficile pour toi que la précédente (nom seul ≥ note de départ ≥ modèle)
+    calPrereq: { intervalle: 'intervalle:modele', 'intervalle:nom': 'intervalle' },
     candidates(ctx) {
       const out = [];
       for (const iv of [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]) for (const dir of [1, -1]) for (const tol of [35, 25, 18]) {
         for (const root of noteRange(ctx, 0)) {
           const other = root + dir * iv;
           if (other < ctx.profile.comfortLow - 2 || other > ctx.profile.comfortHigh + 2) continue;
-          out.push({ root, iv, dir, tol });
+          for (const mode of ['modele', 'depart', 'nom']) {
+            if (mode === 'nom' && !(C.IV_HINTS[iv] && dir > 0)) continue;          // sans chanson-aide, « départ » = nom seul
+            out.push({ root, iv, dir, tol, mode });
+          }
         }
       }
       return out;
     },
-    difficulty: (p, ctx) => IV_COST[p.iv] + (p.dir < 0 ? 0.6 : 0) + 0.6 * tc(p.tol) + 0.4 * rc(Math.max(p.root, p.root + p.dir * p.iv), ctx),
-    label: p => C.IV_NAMES[p.iv] + (p.dir > 0 ? ' ↑' : ' ↓') + ' depuis ' + nm(p.root),
+    difficulty(p, ctx) {
+      const shared = 0.6 * tc(p.tol) + 0.4 * rc(Math.max(p.root, p.root + p.dir * p.iv), ctx);
+      if (p.mode === 'modele') return 0.3 + 0.35 * IV_COST[p.iv] + (p.dir < 0 ? 0.3 : 0) + shared;
+      return IV_COST[p.iv] + (p.dir < 0 ? 0.6 : 0) + shared + (p.mode === 'nom' ? 0.5 : 0);
+    },
+    label: p => C.IV_NAMES[p.iv] + (p.dir > 0 ? ' ↑' : ' ↓') + ' depuis ' + nm(p.root) + (p.mode === 'modele' ? ' · avec modèle' : p.mode === 'nom' ? ' · nom seul' : ''),
     steps(p) {
-      const hint = C.IV_HINTS[p.iv] && p.dir > 0 ? ' — pense à ' + C.IV_HINTS[p.iv] : '';
-      return [
-        listenNote(p.root, 1.4, { label: 'Note de départ' }),
-        singStep(4.5, { type: 'notes', targets: [{ midi: p.root, dur: 1 }, { midi: p.root + p.dir * p.iv, dur: 1.2 }], tol: p.tol },
-          { label: 'Chante la note, puis ' + C.ivDef(p.iv) + (p.dir > 0 ? ' au-dessus' : ' en dessous') + hint }),
-      ];
+      const other = p.root + p.dir * p.iv, where = C.ivDef(p.iv) + (p.dir > 0 ? ' au-dessus' : ' en dessous');
+      const hint = p.mode !== 'nom' && p.mode !== 'modele' && C.IV_HINTS[p.iv] && p.dir > 0 ? ' — pense à ' + C.IV_HINTS[p.iv] : '';
+      // une fenêtre assez longue pour prendre le temps d'entendre la 2e note dans sa tête
+      const sing = label => singStep(6.5, { type: 'notes', targets: [{ midi: p.root, dur: 1 }, { midi: other, dur: 1.2 }], tol: p.tol }, { label });
+      if (p.mode === 'modele') return [listenSeq([p.root, other], 60, { label: 'Écoute : la note de départ, puis ' + where }), sing('Chante les deux notes : la note de départ, puis ' + where)];
+      return [listenNote(p.root, 1.4, { label: 'Note de départ' }), sing('Chante la note, puis ' + where + hint)];
     },
     judge(res, p, ctx) {
       const base = judgeNotes(res, p, ctx);
@@ -1816,7 +1894,7 @@ window.TB = window.TB || {}; TB.VERSION = "1.1 · 2026-10-01";
 
   /* -------------------------------------------------- Souffle & son */
   EX.push({
-    id: 'sss', name: '« Ssss » régulier', comp: 'souffle', also: {}, kind: 'sing', load: 0.3, pillar: 'son',
+    id: 'sss', name: '« Ssss » régulier', comp: 'souffle', also: {}, kind: 'sing', load: 0.3, pillar: 'son', maxTakes: 4,
     why: 'Un débit d’air régulier et économe : c’est l’appui qui tient les fins de phrase et stabilise la justesse.',
     how: ['Inspire bas et silencieusement (ventre, côtes, dos).', 'Souffle un « ssss » fin et parfaitement régulier.', 'Ne vide pas tout au début : le son doit être le même du début à la fin.'],
     cue: 'Imagine que ton « ssss » fait avancer une plume à vitesse constante sur une table.',
@@ -1835,7 +1913,7 @@ window.TB = window.TB || {}; TB.VERSION = "1.1 · 2026-10-01";
   });
 
   EX.push({
-    id: 'tpm', name: 'Temps phonatoire', comp: 'souffle', also: {}, kind: 'sing', load: 0.8, pillar: 'son', testOnly: true,
+    id: 'tpm', name: 'Temps phonatoire', comp: 'souffle', also: {}, kind: 'sing', load: 0.8, pillar: 'son', testOnly: true, maxTakes: 3,
     why: 'Mesure clinique classique : combien de temps tu tiens un « a » confortable sur une seule inspiration.',
     how: ['Inspire bien, sans excès.', 'Tiens un « a » confortable, voix parlée, aussi longtemps que possible sans forcer.', 'Arrête-toi dès que le son se dégrade.'],
     cue: 'Le même son du début à la fin, comme une ligne droite.',
@@ -1959,7 +2037,7 @@ window.TB = window.TB || {}; TB.VERSION = "1.1 · 2026-10-01";
   });
 
   EX.push({
-    id: 'messa', name: 'Messa di voce', comp: 'stabilite', also: { densite: 0.3, souffle: 0.3 }, kind: 'sing', load: 1, pillar: 'son',
+    id: 'messa', name: 'Messa di voce', comp: 'stabilite', also: { densite: 0.3, souffle: 0.3 }, kind: 'sing', load: 1, pillar: 'son', maxTakes: 6,
     why: 'Enfler puis diminuer le son sans que la hauteur ni le timbre ne bougent : l’exercice roi du contrôle du souffle et de l’accolement.',
     how: ['Commence doux mais timbré.', 'Crescendo régulier jusqu’au mezzo-forte/forte.', 'Decrescendo jusqu’au doux… sans que le son devienne soufflé.'],
     cue: 'Le son s’approche puis s’éloigne de l’auditeur, sans changer de couleur.',
@@ -2134,14 +2212,16 @@ window.TB = window.TB || {}; TB.VERSION = "1.1 · 2026-10-01";
   });
 
   EX.push({
-    id: 'aigu-tenu', name: 'Aigu tenu', comp: 'aigu', also: { stabilite: 0.2 }, kind: 'sing', load: 1.2, pillar: 'registres',
+    id: 'aigu-tenu', name: 'Aigu tenu', comp: 'aigu', also: { stabilite: 0.2 }, kind: 'sing', load: 1.2, pillar: 'registres', maxTakes: 7,
     why: 'Tenir une note haute juste et libre quelques secondes : c’est la « preuve » qu’elle est installée et non arrachée.',
-    how: ['Voyelle « o » ou « ou », son mixte et libre.', 'Pas de force : si ça serre, c’est trop haut aujourd’hui.', '3 à 4 secondes, stable.'],
+    how: ['Voyelle « o » ou « ou », son mixte et libre.', 'Pas de force : si ça serre, c’est trop haut aujourd’hui.', '3 à 4 secondes, stable.', 'Après la prise, dis si c’était en voix mixte ou en voix de tête : une note tenue en voix de tête compte moins pour l’aigu.'],
     cue: 'Le son flotte au-dessus de toi, tu le regardes passer.',
+    // le micro ne distingue pas sûrement voix mixte et voix de tête : on te le demande après la prise
+    askRegister: true,
     candidates(ctx) { const out = []; for (let note = ctx.profile.passaggio[1] - 1; note <= ctx.profile.high + (ctx.rangeShift || 0); note++) for (const tol of [35, 30, 25, 20]) out.push({ note, tol }); return out; },
     difficulty: (p, ctx) => 1.5 + 1.2 * rc(p.note, ctx) + 0.5 * tc(p.tol),
-    label: p => nm(p.note) + ' · ±' + p.tol + ' c',
-    steps: p => [listenNote(p.note, 1.6), singStep(5, { type: 'sustain', target: p.note, tol: p.tol }, { label: '« o » tenu, léger et libre', hold: 3.5 })],
+    label: p => nm(p.note) + ' · ±' + p.tol + ' c' + (p.reg === 'tete' ? ' · voix de tête' : p.reg === 'mixte' ? ' · voix mixte' : ''),
+    steps: p => [listenNote(p.note, 1.6), singStep(5, { type: 'sustain', target: p.note, tol: p.tol }, { label: '« o » tenu et libre — en voix mixte si tu peux', hold: 3.5 })],
     judge(res, p, ctx) {
       const fb = recordingIssues(res);
       if (!res.ok || res.success === null || !isFinite(res.err)) return { y: null, success: null, fb };
@@ -2183,7 +2263,7 @@ window.TB = window.TB || {}; TB.VERSION = "1.1 · 2026-10-01";
   });
 
   EX.push({
-    id: 'vibrato', name: 'Droit puis vibrato', comp: 'stabilite', also: { tenue: 0.2 }, kind: 'sing', load: 1, pillar: 'controle',
+    id: 'vibrato', name: 'Droit puis vibrato', comp: 'stabilite', also: { tenue: 0.2 }, kind: 'sing', load: 1, pillar: 'controle', maxTakes: 6,
     why: 'Savoir tenir un son parfaitement droit, puis laisser le vibrato naître sans le fabriquer : signe d’une voix libre et bien soutenue.',
     how: ['3 secondes de son droit, sans aucune ondulation.', 'Puis relâche : laisse le vibrato venir tout seul.', 'Ne le fabrique pas avec la mâchoire.'],
     cue: 'Le son droit est une ligne tendue ; puis la ligne se met à vivre toute seule.',
@@ -2354,6 +2434,8 @@ window.TB = window.TB || {}; TB.VERSION = "1.1 · 2026-10-01";
       deadline: null, health: { hoarseDays: [], lastPain: null },
       songs: [{ id: 's1', title: 'Aux étoiles', artist: 'Colours in the Street', notes: '' }],
       workSong: 's1', imported: null, bilans: [],
+      // un état neuf suit déjà les règles actuelles : pas de recalcul à faire
+      offsets: {}, migr: { cal1: { at: today(ts), changes: null } },
     };
     M.COMPS.forEach(c => { s.skills[c.id] = M.newSkill(4, 2); });
     return s;
@@ -2363,11 +2445,65 @@ window.TB = window.TB || {}; TB.VERSION = "1.1 · 2026-10-01";
   St.migrate = function (s) {
     if (!s || typeof s !== 'object') return St.newState();
     const base = St.newState(s.created);
+    if (s.migr == null) s.migr = {};                 // état d'avant la 1.2 : recalcul à faire (voir plus bas)
     for (const k of Object.keys(base)) if (s[k] == null) s[k] = base[k];
     s.profile = Object.assign(St.defaultProfile(), s.profile || {});
     M.COMPS.forEach(c => { if (!s.skills[c.id]) s.skills[c.id] = M.newSkill(4, 2); });
+    // version 1.2 : niveaux recalculés une fois avec les nouvelles règles (pas pendant une séance en cours)
+    if (!s.migr.cal1 && !s.current) s.migr.cal1 = { at: today(), changes: St.recalibrate(s) };
     s.v = St.VERSION;
     return s;
+  };
+
+  /**
+   * Recalcul des niveaux depuis le dernier bilan avec les règles actuelles : étalonnage par exercice (un exercice
+   * hors de portée ne fait plus chuter sa compétence), phrase de chanson sans avis non comptée, aigu tenu de
+   * registre inconnu mis de côté. Les prises sont rejouées dans l'ordre, comme en séance.
+   * Renvoie { compétence: [avant, après] } (null s'il n'y a rien à recalculer).
+   */
+  St.recalibrate = function (s) {
+    const C = TB.catalog, b = (s.bilans || []).filter(x => x && x.after).slice(-1)[0];
+    if (!b) return null;
+    let i0 = -1;
+    for (let i = s.sessions.length - 1; i >= 0; i--) if (s.sessions[i].type === 'B' && s.sessions[i].date === b.date) { i0 = i; break; }
+    const after = i0 >= 0 ? s.sessions.slice(i0 + 1) : [];
+    if (!after.length) return null;
+    // aigu tenu d'avant la question du registre : on ne sait pas s'il était en voix mixte ou en voix de tête
+    // (l'exercice demandait alors un son « léger »). Ces prises ne disent rien de l'aigu en voix mixte : la
+    // compétence repart de son estimation d'avant le bilan, avec une incertitude large, et tes prochaines
+    // réponses (et le prochain bilan) la fixeront.
+    const unknownReg = t => { const e = C.EX[t.ex]; return !!(e && e.askRegister && !t.reg); };
+    const blind = new Set((s.sessions[i0].takes || []).filter(unknownReg).map(t => C.EX[t.ex].comp));
+    const work = { skills: {}, offsets: {} };
+    for (const c of M.COMPS) {
+      const old = s.skills[c.id], unk = blind.has(c.id) && b.before && b.before[c.id] != null;
+      const th = unk ? b.before[c.id] : b.after[c.id] != null ? b.after[c.id] : old.th;
+      work.skills[c.id] = Object.assign(M.newSkill(th, unk ? 1.5 : (b.measured || []).includes(c.id) ? 0.8 : 1.2), { hist: (old.hist || []).filter(h => h[0] <= b.date).map(h => h.slice()) });
+      if (unk) { const h = work.skills[c.id].hist, lastH = h[h.length - 1]; if (lastH && lastH[0] === b.date) lastH[1] = +th.toFixed(2); else h.push([b.date, +th.toFixed(2)]); }
+    }
+    for (const sess of after) {
+      (sess.takes || []).forEach((t, j) => {
+        const ex = C.EX[t.ex], ts = (sess.ts || Date.parse(sess.date)) + j * 1000, m = t.m || {};
+        if (!ex || !ex.comp) return;
+        let y = t.y, w = 1;
+        if (y == null && t.self != null) {
+          if (ex.kind === 'song' && t.self === 0) return;          // ancienne phrase « rien coché » : pas d'avis
+          y = t.self; w = 0.5;
+        }
+        if (y != null && isFinite(t.d) && !unknownReg(t)) St.applyTake(work, ex, t.k || ex.id, t.d, y, w, ts);
+        if (t.ex === 'discri' && isFinite(m.jnd)) M.observe(work.skills.oreille, M.scale(m.jnd, M.SCALES.jnd), 1, ts);
+        if (t.ex === 'sss' && isFinite(m.hiss)) M.observe(work.skills.souffle, M.scale(m.hiss, M.SCALES.hiss), 1.4, ts);
+        if (t.ex === 'tpm' && isFinite(m.mpt)) M.observe(work.skills.souffle, M.scale(m.mpt, M.SCALES.mpt), 1.6, ts);
+      });
+    }
+    const changes = {};
+    for (const c of M.COMPS) {
+      const a = s.skills[c.id], w2 = work.skills[c.id];
+      changes[c.id] = [+a.th.toFixed(2), +w2.th.toFixed(2)];
+      a.th = w2.th; a.sd = w2.sd; a.hist = w2.hist;
+    }
+    s.offsets = work.offsets;
+    return changes;
   };
 
   /* ---------------------------------------------------------------- densité */
@@ -2425,6 +2561,8 @@ window.TB = window.TB || {}; TB.VERSION = "1.1 · 2026-10-01";
     return {
       bestVfe: vfe && vfe.length ? Math.max(...vfe.slice(-12).map(x => x[1])) : null,
       profile: s.profile,
+      offsets: s.offsets || {},
+      now: plan && plan.date ? Date.parse(plan.date) : Date.now(),
       rangeShift: plan ? plan.rangeShift || 0 : 0,
       densityRef: (midi, o) => St.densityRef(s, midi, o),
       song: song ? song.title : '',
@@ -2444,11 +2582,7 @@ window.TB = window.TB || {}; TB.VERSION = "1.1 · 2026-10-01";
     let y = j.y, w = 1;
     if (y == null && take.self != null) { y = take.self; w = 0.5; }   // auto-évaluation : poids réduit
     if (ex && ex.comp && s.skills[ex.comp]) s.skills[ex.comp].lastMain = ts;      // pratique directe (espacement)
-    if (ex && ex.comp && y != null && isFinite(take.d)) {
-      const p = M.update(s.skills[ex.comp], take.d, y, w, ts);
-      // compétences secondaires : seulement la surprise du résultat (voir M.nudge)
-      for (const [c, cw] of Object.entries(ex.also || {})) if (s.skills[c]) M.nudge(s.skills[c], y - p, cw * w, ts);
-    }
+    if (ex && ex.comp && y != null && isFinite(take.d)) St.applyTake(s, ex, St.calKey(ex, take.params), take.d, y, w, ts);
     if (j.observe && s.skills[j.observe.comp]) M.observe(s.skills[j.observe.comp], j.observe.level, j.observe.noise, ts);
     // statistiques de l'exercice
     const it = s.items[take.ex] = s.items[take.ex] || { n: 0, ok: 0, last: 0, first: ts };
@@ -2477,6 +2611,24 @@ window.TB = window.TB || {}; TB.VERSION = "1.1 · 2026-10-01";
     }
   };
 
+  /** Clé d'étalonnage d'une prise : l'exercice, ou sa variante (intervalle avec modèle, sans aide…). */
+  St.calKey = (ex, params) => (ex && ex.calKey ? ex.calKey(params || {}) : ex ? ex.id : null);
+  /**
+   * Effet d'une prise sur les niveaux : compétence principale avec étalonnage de l'exercice (M.updateCal),
+   * puis compétences secondaires par la seule surprise du résultat (voir M.nudge).
+   */
+  St.applyTake = function (s, ex, key, d, y, w, ts) {
+    if (!s.offsets[key]) {
+      const o = M.newOffset(), pre = ex.calPrereq && s.offsets[ex.calPrereq[key]];
+      if (pre) { o.b = Math.max(0, pre.b); o.ema = pre.ema; }                // une variante neuve part de la précédente
+      s.offsets[key] = o;
+    }
+    const off = s.offsets[key];
+    const u = M.updateCal(s.skills[ex.comp], off, d, y, w, ts);
+    for (const [c, cw] of Object.entries(ex.also || {})) if (s.skills[c]) M.nudge(s.skills[c], u.r, cw * w, ts);
+    return u;
+  };
+
   /** Voyelle chantée des exercices dont les paramètres ne la précisent pas. */
   St.EX_VOWEL = { legato: 'ou', 'aigu-tenu': 'o', voyelle: 'o', vfe: 'o' };
 
@@ -2493,10 +2645,11 @@ window.TB = window.TB || {}; TB.VERSION = "1.1 · 2026-10-01";
    * Photo de ce qu'une prise modifie, pour pouvoir la corriger après coup (« Mesure fausse ? »,
    * « Ça forçait ») : on restaure, puis on réenregistre la prise corrigée — elle ne compte qu'une fois.
    */
-  St.snapshot = (s, exId) => JSON.stringify({ skills: s.skills, item: s.items[exId] || null, calib: s.calib, series: s.series, dens: s.dens, speech: s.profile.speech });
+  St.snapshot = (s, exId) => JSON.stringify({ skills: s.skills, item: s.items[exId] || null, calib: s.calib, series: s.series, dens: s.dens, speech: s.profile.speech, offsets: s.offsets });
   St.restore = function (s, exId, snap) {
     const o = JSON.parse(snap);
     s.skills = o.skills; s.calib = o.calib; s.series = o.series; s.dens = o.dens; s.profile.speech = o.speech;
+    if (o.offsets) s.offsets = o.offsets;
     if (o.item) s.items[exId] = o.item; else delete s.items[exId];
   };
   St.addCalibration = function (s, pred, truth) {
@@ -2521,7 +2674,8 @@ window.TB = window.TB || {}; TB.VERSION = "1.1 · 2026-10-01";
     // durée active (pauses et arrière-plan exclus), bornée : une séance reprise le lendemain ne compte pas 11 h
     sess.minutes = Math.min(180, Math.round((isFinite(sess.activeMs) ? sess.activeMs : sess.end - sess.ts) / 60000));
     // un journal compact (pas les courbes de hauteur)
-    const compact = Object.assign({}, sess, { startSkills: undefined, takes: sess.takes.map(t => ({ ex: t.ex, d: +(+t.d || 0).toFixed(2), y: t.judged ? t.judged.y : null, ok: t.judged ? t.judged.success : null, self: t.self, pred: t.predicted, m: t.judged ? t.judged.metrics : null, strain: t.strain || undefined, disputed: t.disputed != null ? t.disputed : undefined })) });
+    const keyOf = t => { const e = TB.catalog.EX[t.ex], k = e && t.params ? St.calKey(e, t.params) : null; return k && k !== t.ex ? k : undefined; };
+    const compact = Object.assign({}, sess, { startSkills: undefined, takes: sess.takes.map(t => ({ ex: t.ex, k: keyOf(t), d: +(+t.d || 0).toFixed(2), y: t.judged ? t.judged.y : null, ok: t.judged ? t.judged.success : null, self: t.self, pred: t.predicted, m: t.judged ? t.judged.metrics : null, reg: t.params && t.params.reg || undefined, strain: t.strain || undefined, disputed: t.disputed != null ? t.disputed : undefined })) });
     // pauses : un trou de plus de 4 jours ne fait pas avancer le programme
     const prev = s.sessions[s.sessions.length - 1];
     if (prev) { const gap = St.dayDiff(prev.date, sess.date); if (gap > 4) s.program.pausedDays += gap - 4; }
@@ -2605,9 +2759,12 @@ window.TB = window.TB || {}; TB.VERSION = "1.1 · 2026-10-01";
   P.GOAL_BOOST = { densite: 1.15, poitrine: 1.1, tenue: 1.1, melodie: 1.05, oreille: 1.05 };
 
   const TYPES = {
-    T: { name: 'Registres & son', slots: [['poitrine', 'passage', 'aigu'], ['densite', 'poitrine'], ['tenue', 'melodie'], ['stabilite', 'souffle', 'agilite'], ['passage', 'aigu', 'poitrine'], ['oreille', 'melodie']] },
-    J: { name: 'Justesse & oreille', slots: [['oreille'], ['tenue'], ['melodie'], ['souffle', 'stabilite', 'densite', 'agilite'], 'mix', ['densite', 'poitrine']] },
-    A: { name: 'Application : ta chanson', slots: [['densite', 'poitrine', 'passage', 'tenue'], 'song', 'song', ['scene'], ['melodie', 'tenue']] },
+    T: { name: 'Registres & son', slots: [['poitrine', 'passage', 'aigu'], ['densite', 'poitrine'], ['tenue', 'melodie'], ['stabilite', 'souffle', 'agilite'], ['passage', 'aigu', 'poitrine'], ['oreille', 'melodie']],
+      extra: [['densite', 'tenue'], ['passage', 'aigu'], ['melodie', 'oreille'], ['poitrine', 'densite']] },
+    J: { name: 'Justesse & oreille', slots: [['oreille'], ['tenue'], ['melodie'], ['souffle', 'stabilite', 'densite', 'agilite'], 'mix', ['densite', 'poitrine']],
+      extra: [['melodie', 'tenue'], ['densite', 'poitrine'], ['oreille', 'melodie'], ['stabilite', 'agilite', 'souffle']] },
+    A: { name: 'Application : ta chanson', slots: [['densite', 'poitrine', 'passage', 'tenue'], 'song', 'song', ['scene'], ['melodie', 'tenue']],
+      extra: [['poitrine', 'passage', 'densite'], ['tenue', 'melodie'], ['stabilite', 'souffle'], ['aigu', 'passage']] },
   };
   P.TYPES = TYPES;
 
@@ -2619,6 +2776,32 @@ window.TB = window.TB || {}; TB.VERSION = "1.1 · 2026-10-01";
     return fixed[ex.id] || 30;
   }
   P.takeSec = takeSec;
+  const median = a => { const v = a.slice().sort((x, y) => x - y), n = v.length; return n ? (n % 2 ? v[(n - 1) / 2] : (v[n / 2 - 1] + v[n / 2]) / 2) : NaN; };
+  /** Durée par défaut des étapes guidées (échauffement, retour au calme…), pour estimer une séance passée. */
+  const GUIDED_SEC = { paille: 90, trilles: 90, retour: 60, detente: 240, imagerie: 130 };
+  /** Durée prévue (s) des prises d'une séance passée, selon les estimations ci-dessus. */
+  P.estSessionSec = sess => (sess.takes || []).reduce((a, t) => { const e = C.EX[t.ex]; return a + (!e ? 0 : e.kind === 'guided' ? (GUIDED_SEC[t.ex] || 90) : takeSec(e)); }, 0);
+  /**
+   * Ton rythme réel : durée active de tes dernières séances ÷ durée prévue pour les mêmes prises (médiane des
+   * 6 dernières). Moins de 1 : tu enchaînes plus vite que prévu, donc la séance prévoit plus de prises pour
+   * tenir la durée que tu as choisie.
+   */
+  P.pace = function (s) {
+    const L = P.mainSessions(s).filter(x => x.minutes >= 3).slice(-6).map(x => x.minutes * 60 / Math.max(60, P.estSessionSec(x)));
+    return L.length >= 2 ? Math.max(0.45, Math.min(1.3, median(L))) : 1;
+  };
+  /**
+   * Montée progressive : une séance ne dépasse pas tes dernières séances réelles de plus de 35 % (ou 4 min).
+   * Une charge vocale qui augmente par paliers laisse à la voix le temps de s'adapter.
+   */
+  P.rampMinutes = function (s) {
+    const L = P.mainSessions(s).filter(x => x.minutes >= 3).slice(-3).map(x => x.minutes);
+    if (L.length < 2) return null;
+    const m = median(L);
+    return Math.max(10, Math.round(Math.max(m * 1.35, m + 4)));
+  };
+  /** Jours (de calendrier) depuis la dernière prise d'un exercice (null : jamais fait). */
+  P.daysSince = (s, exId, date) => { const it = s.items[exId]; return it && it.last ? St.dayDiff(St.today(it.last), date) : null; };
 
   /** Forme du jour → réglages de séance. */
   P.readiness = function (ck) {
@@ -2735,6 +2918,12 @@ window.TB = window.TB || {}; TB.VERSION = "1.1 · 2026-10-01";
     const lr = P.loadRatio(s, date);
     if (lr.ratio != null && lr.ratio > 1.35 && s.sessions.length >= 8) { factor *= 0.8; plan.notes.push('Charge de la semaine au-dessus de ton habitude : séance réduite de 20 %.'); }
     if (dl != null && dl >= 2 && dl <= 10) { factor *= 0.65; plan.reasons.push('J−' + dl + ' avant « ' + (s.deadline.label || 'ton échéance') + ' » : volume réduit, intensité gardée (affûtage).'); }
+    // montée progressive vers la durée choisie (sauf durée réglée à la main pour aujourd'hui)
+    const ramp = o.minutes ? null : P.rampMinutes(s);
+    if (ramp && ramp < minutes && type !== 'B') {
+      plan.notes.push('Montée progressive vers tes ' + minutes + ' min : ' + ramp + ' min aujourd’hui (au plus +35 % d’une séance à l’autre, le temps que la voix s’habitue).');
+      minutes = ramp;
+    }
     minutes = Math.max(8, Math.round(minutes * factor));
     plan.minutes = minutes;
     plan.reasons.unshift('Semaine ' + week + '/16 · bloc ' + blk.n + ' « ' + blk.name + ' »');
@@ -2749,10 +2938,15 @@ window.TB = window.TB || {}; TB.VERSION = "1.1 · 2026-10-01";
     const cool = [{ ex: 'retour', sec: 60 }];
     let mainSec = minutes * 60 - warm.reduce((a, b) => a + b.sec, 0) - 60;
     const T = TYPES[type];
-    const nBlocks = Math.max(2, Math.min(T.slots.length, Math.round(mainSec / 220)));
+    // ton rythme réel règle le nombre de prises : la séance dure vraiment le temps choisi
+    const pace = P.pace(s), unit = ex => takeSec(ex) * pace;
+    const maxTakes = Math.max(7, Math.min(10, Math.round(7 / pace)));
+    const allSlots = T.slots.concat(T.extra || []);
+    const nBlocks = Math.max(2, Math.min(allSlots.length, Math.round(mainSec / (maxTakes * 24 * pace))));
     const blockSec = mainSec / nBlocks;
     // nombre de prises d'un bloc (le protocole VFE, la simulation et les tests sont des prises uniques)
-    const nTakes = ex => ex.kind === 'quiz' || ex.kind === 'guided' || ex.id === 'simulation' || ex.id === 'vfe' ? 1 : Math.max(2, Math.min(7, Math.round(blockSec / takeSec(ex))));
+    const capOf = ex => Math.min(maxTakes, (ex && ex.maxTakes) || maxTakes);       // souffle long, aigu… : moins de répétitions
+    const nTakes = ex => ex.kind === 'quiz' || ex.kind === 'guided' || ex.id === 'simulation' || ex.id === 'vfe' ? 1 : Math.max(2, Math.min(capOf(ex), Math.round(blockSec / unit(ex))));
 
     // priorités par compétence
     const pri = {};
@@ -2771,11 +2965,11 @@ window.TB = window.TB || {}; TB.VERSION = "1.1 · 2026-10-01";
     const used = new Set();
     const items = [];
 
-    const slots = T.slots.slice(0, nBlocks);
+    const slots = allSlots.slice(0, nBlocks);
     for (const slot of slots) {
-      if (slot === 'song') { items.push({ ex: 'phrase', takes: Math.max(2, Math.round(blockSec / takeSec(C.EX.phrase))), comp: 'scene' }); continue; }
+      if (slot === 'song') { items.push({ ex: 'phrase', takes: Math.max(2, Math.min(6, Math.round(blockSec / unit(C.EX.phrase)))), comp: 'scene' }); continue; }
       if (slot === 'mix') {
-        items.push({ mix: ['tenue', 'echo', 'intervalle'], takes: Math.max(4, Math.min(7, Math.round(blockSec / 24))), comp: 'melodie', label: 'Mélange justesse (alterné)' });
+        items.push({ mix: ['tenue', 'echo', 'intervalle'], takes: Math.max(4, Math.min(maxTakes, Math.round(blockSec / (24 * pace)))), comp: 'melodie', label: 'Mélange justesse (alterné)' });
         continue;
       }
       const opts = slot.filter(c => !used.has(c));
@@ -2794,6 +2988,8 @@ window.TB = window.TB || {}; TB.VERSION = "1.1 · 2026-10-01";
         let w = (blk.prefer[e.id] || 1);
         if (lastEx.has(e.id)) w *= 0.6;
         if (!it) w *= newToday >= 1 ? 0.05 : 1.15;
+        if (C.allOutOfReach(e, s.offsets, nowTs)) w *= 0.1;          // hors de portée pour l'instant : revient plus tard
+        if (items.some(it => it.ex === e.id)) w *= 0.3;              // déjà au programme du jour : un autre exercice d'abord
         return w * (0.85 + 0.3 * r());
       });
       let bi = 0; weights.forEach((w, i) => { if (w > weights[bi]) bi = i; });
@@ -2828,17 +3024,26 @@ window.TB = window.TB || {}; TB.VERSION = "1.1 · 2026-10-01";
       const mate = mates[Math.floor(r() * mates.length) % mates.length];
       it.mix = [e.id, mate.id]; it.label = e.name + ' ⇄ ' + mate.name;
     }
-    // ajuste le nombre de prises pour tenir la durée prévue (± une prise par bloc)
-    const est = () => items.reduce((a, it) => a + it.takes * (it.mix ? 24 : takeSec(C.EX[it.ex])), 0);
-    for (let guard = 0; guard < 30; guard++) {
+    // oreille fine au moins tous les 3 jours (2 à 3 fois par semaine) : 2 à 3 minutes, sans fatigue vocale.
+    // Le seuil de discrimination s'affine avec l'entraînement (Micheyl et al. 2006).
+    const ear = P.daysSince(s, 'discri', date);
+    if ((ear == null || ear >= 3) && !items.some(it => it.ex === 'discri')) {
+      items.splice(Math.ceil(items.length / 2), 0, { ex: 'discri', takes: 1, comp: 'oreille' });
+      plan.reasons.push('Oreille fine : 2 à 3 fois par semaine, pour entendre les petits écarts de justesse.');
+    }
+    // ajuste le nombre de prises pour tenir la durée prévue (± une prise par bloc), au rythme réel
+    const unitOf = it => (it.mix ? 24 * pace : unit(C.EX[it.ex]));
+    const est = () => items.reduce((a, it) => a + it.takes * unitOf(it), 0);
+    for (let guard = 0; guard < 60; guard++) {
       const diff = mainSec - est();
       if (Math.abs(diff) < 20) break;
-      const adj = items.filter(it => it.ex !== 'simulation' && it.ex !== 'vfe' && !(it.ex && ['quiz', 'guided'].includes(C.EX[it.ex].kind)) && (diff > 0 ? it.takes < 7 : it.takes > 2));
+      const capIt = it => Math.min(...(it.mix || [it.ex]).map(id => capOf(C.EX[id])));
+      const adj = items.filter(it => it.ex !== 'simulation' && it.ex !== 'vfe' && it.ex !== 'phrase' && !(it.ex && ['quiz', 'guided'].includes(C.EX[it.ex].kind)) && (diff > 0 ? it.takes < capIt(it) : it.takes > 2));
       if (!adj.length) break;
       const it = adj.sort((a, b) => (diff > 0 ? a.takes - b.takes : b.takes - a.takes))[0];
-      const unit = it.mix ? 24 : takeSec(C.EX[it.ex]);
-      if (diff < 0 && -diff < unit / 2) break;
-      if (diff > 0 && diff < unit / 2) break;
+      const u = unitOf(it);
+      if (diff < 0 && -diff < u / 2) break;
+      if (diff > 0 && diff < u / 2) break;
       it.takes += diff > 0 ? 1 : -1;
     }
     // ordre : ce qui est exigeant vocalement tôt (voix fraîche mais échauffée), l'oreille comme respiration,
@@ -3968,9 +4173,19 @@ window.TB = window.TB || {}; TB.VERSION = "1.1 · 2026-10-01";
       const n = s.calib.recent.length;
       if (Math.random() < (n < 10 ? 0.5 : 0.3)) predicted = await askPredict(PITCH_PRED[ex.id], head);
     }
+    // aigu : voix mixte ou voix de tête ? Une note juste en voix de tête compte « presque » (voir C.REG_CAP)
+    let regCap = 1;
+    if (ex.askRegister && (res || !R.mic)) {
+      const reg = await askRegister(head);
+      regCap = C.REG_CAP[reg];
+      params = Object.assign({}, params, { reg });
+      if (judged.y != null && regCap < judged.y) {
+        judged = Object.assign({}, judged, { y: regCap, success: false, fb: [{ kind: 'info', text: reg === 'tete' ? 'Juste, en voix de tête : compté « presque » pour l’aigu (le but est la voix mixte).' : 'Registre incertain : compté « presque ».' }].concat(judged.fb || []) });
+      }
+    }
     let self = null;
     if (song) self = song.self;
-    else if (judged.y == null && ex.kind === 'sing') self = await askSelf(head, judged.fb);
+    else if (judged.y == null && ex.kind === 'sing') self = Math.min(regCap, await askSelf(head, judged.fb));
     const take = { ex: ex.id, params, d, judged, res: slimRes(res), self, predicted, pre: pre.map(slimRes), ts: Date.now() };
     const snap = St.snapshot(s, ex.id);          // pour corriger la prise après coup sans la compter deux fois
     St.recordTake(s, take, take.ts);
@@ -4238,9 +4453,9 @@ window.TB = window.TB || {}; TB.VERSION = "1.1 · 2026-10-01";
     const chosen = new Set();
     const draw = () => frame(
       `<div class="card flat">${(judged.fb || []).map(f => `<div class="fb ${f.kind}"><span class="dot"></span><span>${U.esc(f.text)}</span></div>`).join('') || '<p class="small muted">Écoute-toi et coche ce qui était réussi.</p>'}</div>
-      <h3>Ce qui était réussi</h3><div class="chips">${crit.map(([k, l]) => `<button class="chip ${chosen.has(k) ? 'on' : ''}" data-act="crit" data-arg="${k}">${l}</button>`).join('')}</div>` +
+      <h3>Ce qui était réussi</h3><div class="chips">${crit.map(([k, l]) => `<button class="chip ${chosen.has(k) ? 'on' : ''}" data-act="crit" data-arg="${k}">${l}</button>`).join('')}</div><p class="tiny faint">${chosen.size ? 'Ta note : ' + chosen.size + ' point(s) réussi(s) sur ' + crit.length + '.' : 'Rien de coché : la prise est gardée mais pas notée.'}</p>` +
       (st.pressure ? `<h3>Stress ressenti</h3><div class="chips">${[1, 2, 3, 4, 5].map(v => `<button class="chip ${R.stress === v ? 'on' : ''}" data-act="stress" data-arg="${v}">${v}</button>`).join('')}</div><p class="tiny faint">1 = serein · 5 = très stressé. Suivre ce chiffre montre l’habituation à la pression.</p>` : ''),
-      (pcm && pcm.length ? btn('song-play', '▶ Réécouter', 'block') : '') + btn('song-done', 'Valider', 'primary big block'), head);
+      (pcm && pcm.length ? btn('song-play', '▶ Réécouter', 'block') : '') + btn('song-done', chosen.size ? 'Valider' : 'Valider sans noter', 'primary big block'), head);
     R.stress = null; draw();
     for (;;) {
       const a = await U.wait(['crit', 'song-play', 'song-done', 'stress']);
@@ -4250,7 +4465,8 @@ window.TB = window.TB || {}; TB.VERSION = "1.1 · 2026-10-01";
       else { A.stopAll(); break; }
     }
     if (st.pressure && R.stress) St.addSeries(s, 'stress', R.stress);
-    return { res, pcm, sr, self: chosen.size >= 3 ? 1 : chosen.size >= 2 ? 0.5 : 0 };
+    // la note suit la part des points cochés ; rien de coché = pas d'avis (et non « tout raté »)
+    return { res, pcm, sr, self: chosen.size ? chosen.size / crit.length : null };
   }
 
   /* ------------------------------------------------------------ prédiction et auto-évaluation */
@@ -4258,6 +4474,12 @@ window.TB = window.TB || {}; TB.VERSION = "1.1 · 2026-10-01";
     const opts = kind === 'sustain' ? [['juste', 'Juste'], ['bas', 'Trop bas'], ['haut', 'Trop haut'], ['?', 'Je ne sais pas']] : [['juste', 'Toutes justes'], ['faux', 'Au moins une fausse'], ['?', 'Je ne sais pas']];
     frame(stage('Avant de voir : c’était…', 'Deviner d’abord entraîne ton oreille interne — c’est elle qui te guide sur scène.'), `<div class="predict">${opts.map(([v, l]) => btn('pred', l, v === '?' ? 'ghost' : '', v)).join('')}</div>`, head);
     const a = await U.wait(['pred']);
+    return a.arg;
+  }
+  async function askRegister(head) {
+    frame(stage('C’était en…', 'Voix mixte : pleine, proche de ta voix parlée. Voix de tête : légère, flûtée (fausset). Une note tenue en voix de tête compte moins pour l’aigu.'),
+      `<div class="predict">${btn('reg', 'Voix mixte', '', 'mixte')}${btn('reg', 'Voix de tête', '', 'tete')}${btn('reg', 'Je ne sais pas', 'ghost', '?')}</div>`, head);
+    const a = await U.wait(['reg']);
     return a.arg;
   }
   async function askSelf(head, fb) {
@@ -4426,6 +4648,12 @@ window.TB = window.TB || {}; TB.VERSION = "1.1 · 2026-10-01";
     const dl = s.deadline && s.deadline.date ? St.dayDiff(St.today(), s.deadline.date) : null;
     let h = `<header class="topbar"><div class="brand">TIMBRE</div><span class="tag accent">${(s.program.cycle || 1) > 1 ? 'Cycle ' + s.program.cycle + ' · ' : ''}S${week} · ${esc(blk.name)}</span></header><section class="screen">`;
     h += `<div class="card hero"><div class="small muted">${esc(U.dateLong(t.date))}</div><h1 style="margin-top:2px">Bloc ${blk.n} · ${esc(blk.name)}</h1><p class="muted" style="margin-top:6px">${esc(blk.goal)}</p><div class="weeks" style="margin-top:14px" aria-label="Semaine ${week} sur 16">${weeks}</div><div class="row between tiny faint" style="margin-top:6px"><span>S1</span><span>bilans aux semaines 4 · 8 · 12 · 16</span><span>S16</span></div>${weekCount(s, week)}</div>`;
+    // mise à jour 1.2 : niveaux recomptés depuis le bilan (une fois)
+    const cal = s.migr && s.migr.cal1, fr1 = v => (+v).toFixed(1).replace('.', ',');
+    if (cal && cal.changes && !cal.seen) {
+      const moved = Object.entries(cal.changes).filter(([k, [a, b]]) => M.COMP[k] && Math.abs(b - a) >= 0.3).map(([k, [a, b]]) => esc(M.COMP[k].short) + ' ' + fr1(a) + ' → ' + fr1(b));
+      if (moved.length) h += `<div class="card"><h3>Niveaux recalculés</h3><p class="small muted" style="margin:4px 0 8px">Chaque exercice apprend maintenant s’il est plus dur ou plus facile pour toi que prévu : un exercice hors de portée ne fait plus chuter toute une compétence, et une phrase de chanson sans case cochée n’est plus comptée comme ratée. Tes séances depuis le bilan ont été recomptées avec ces règles.</p><p class="small">${moved.join(' · ')}</p><p class="tiny faint" style="margin-top:6px">Aigu : tes anciens aigus tenus ne disaient pas s’ils étaient en voix mixte ou en voix de tête ; l’aigu repart de ton estimation d’avant le bilan, et l’app te pose désormais la question après chaque prise.</p><div style="margin-top:10px">${btn('cal-seen', 'Compris', 'small')}</div></div>`;
+    }
     if (s.current && s.current.plan && St.dayDiff(s.current.date || St.today(), St.today()) <= 1) {
       h += `<div class="card"><h3>Séance en cours</h3><p class="small muted" style="margin:4px 0 10px">${esc(s.current.plan.title || '')} — bloc ${s.current.idx + 1}/${s.current.plan.items.length}</p><div class="row">${btn('resume', 'Reprendre', 'primary grow')}${btn('drop-current', 'Abandonner', 'ghost')}</div></div>`;
     }
@@ -4502,6 +4730,7 @@ window.TB = window.TB || {}; TB.VERSION = "1.1 · 2026-10-01";
   U.on('start', () => { const p = currentPlan(); if (p) { extraFor = null; U.startSession(p); } });
   U.on('resume', () => { const s = S(); if (s.current) U.startSession(s.current.plan, s.current); });
   U.on('drop-current', () => { S().current = null; save(); U.render(); });
+  U.on('cal-seen', () => { const c = S().migr && S().migr.cal1; if (c) c.seen = true; save(); U.render(); });
   U.on('quick', what => {
     const s = S();
     if (what === 'detente') U.startSession({ type: 'R', title: 'Voix fatiguée', minutes: 5, items: [{ ex: 'detente', sec: 240 }], rangeShift: -3, targetP: 0.9, notes: [], reasons: [] });
@@ -4751,6 +4980,9 @@ window.TB = window.TB || {}; TB.VERSION = "1.1 · 2026-10-01";
     ['Brockmann-Bauser et al. (2021). Effects of vocal intensity and fundamental frequency on cepstral peak prominence. Journal of Voice 35(3).', 'Le CPPS dépend du volume et de la hauteur : comparaisons à conditions égales.'],
     ['Shea & Morgan (1979). Contextual interference effects on the acquisition, retention, and transfer of a motor skill. JEP: Human Learning and Memory 5(2).', 'Alterner les exercices connus fait mieux retenir que les répéter en bloc.'],
     ['Larrouy-Maestri (2018). « I know it when I hear it »: on listeners’ perception of mistuning. Music & Science 1.', 'Seuils de justesse perçue (≈ 10–25 cents).'],
+    ['Klinkenberg, Straatemeier & van der Maas (2011). Computer adaptive practice of Maths ability using a new item response model for on the fly ability and difficulty estimation. Computers & Education 57(2).', 'Ton niveau et la difficulté de chaque exercice s’estiment ensemble, prise après prise.'],
+    ['Pelánek (2016). Applications of the Elo rating system in adaptive educational systems. Computers & Education 98.', 'Étalonnage par exercice : un exercice mal calibré pour toi n’entraîne plus toute la compétence.'],
+    ['Micheyl, Delhommeau, Perrot & Oxenham (2006). Influence of musical and psychoacoustical training on pitch discrimination. Hearing Research 219.', 'Le seuil d’oreille s’affine avec l’entraînement : « Oreille fine » 2 à 3 fois par semaine.'],
     ['Hillenbrand & Houde (1996). Acoustic correlates of breathy vocal quality. Journal of Speech and Hearing Research 39(2).', 'CPPS : mesure de référence du souffle dans la voix.'],
     ['Maryn & Weenink (2015). Objective dysphonia measures in the program Praat: smoothed cepstral peak prominence and acoustic voice quality index. Journal of Voice 29(1).', 'Notre CPPS reproduit celui de Praat (écart médian < 1 dB).'],
     ['Titze (2006). Voice training and therapy with a semi-occluded vocal tract: rationale and scientific underpinnings. JSLHR 49(2).', 'Paille, trilles, « ng » : échauffement et récupération.'],
@@ -4774,6 +5006,9 @@ window.TB = window.TB || {}; TB.VERSION = "1.1 · 2026-10-01";
       <li>Chaque compétence a un niveau estimé ; chaque exercice est généré pour que tu réussisses environ 4 prises sur 5.</li>
       <li>Retour après la prise (jamais pendant), bref, centré sur une chose ; parfois tu devines d’abord.</li>
       <li>Un exercice nouveau se travaille d’abord en bloc ; une fois connu, il alterne avec un autre de la même compétence (mieux retenu). Compétences revues à intervalles réguliers, bilans toutes les 4 semaines (rattrapés si tu les manques).</li>
+      <li>Chaque exercice apprend s’il est plus dur ou plus facile <i>pour toi</i> que prévu. Un exercice hors de portée ne fait pas chuter toute la compétence : il revient plus tard, ou dans sa version guidée (intervalle d’abord écouté, puis avec la seule note de départ, puis d’après son nom).</li>
+      <li>Aigu tenu : tu dis après la prise si c’était en voix mixte ou en voix de tête ; l’aigu se compte en voix mixte.</li>
+      <li>La séance dure le temps que tu as choisi : l’app apprend ton rythme réel et monte par paliers (au plus +35 % d’une séance à l’autre).</li>
       <li>Les modèles : voix de synthèse aux formants fixes (le même timbre seule ou dans une mélodie), sans vibrato (plus facile à imiter juste), notes graves rendues nettes sur haut-parleur. Volume réglable.</li>
       <li>Forme du jour, charge vocale, pauses et échéance ajustent la séance.</li></ul></div>`;
     h += `<div class="card"><h3>Santé vocale</h3><ul class="small" style="margin:8px 0 0;padding-left:18px"><li>Douleur en chantant : on arrête.</li><li>Enrouement qui dure plus de deux semaines : consulte un ORL ou un phoniatre.</li><li>Voix fatiguée : travail très doux (paille, bouche fermée) plutôt que forcer ou chuchoter.</li><li>Hydratation, sommeil, et pas de gros volume la veille d’une échéance.</li></ul></div>`;
