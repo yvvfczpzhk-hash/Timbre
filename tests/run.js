@@ -359,5 +359,20 @@ test('programme de 20 semaines avec un exercice mal calibré : la compétence re
   ok(s.offsets.intervalle && s.offsets.intervalle.b > 1, 'intervalle sans modèle non repéré comme plus dur');
 });
 
+test('« Du parlé au chanté » dans une pièce bruyante, puis ressenti : pas de plantage (1.2.1)', () => {
+  // le cas rencontré : densité non jugée (bruit) → ressenti demandé → la séance s'arrêtait sur « value.toFixed »
+  const s = St.newState(), p = { note: 57, vowel: 'a' }, c2 = St.ctx(s, null);
+  const f = t => (t > 0.5 && t < 0.85) || (t > 1.3 && t < 5.5) ? S.midiToHz(57) : 0;
+  const res = D.analyzeTake(S.synth(f, { dur: 6.5, vowel: 'a', snr: 18 }), S.FS, C.EX['parle-chante'].steps(p)[1].rec.spec);
+  const j = C.EX['parle-chante'].judge(res, p, c2);
+  ok(j.y == null && j.metrics.gap == null, 'le cas doit être « densité non jugée » : y = ' + j.y);
+  St.recordTake(s, { ex: 'parle-chante', params: p, d: 2, judged: j, self: 0.5, res: null }, Date.now());
+  ok(!(s.series.pcGap || []).length && s.items['parle-chante'].n === 1, 'prise mal enregistrée');
+  // aucune série ni densité ne garde une valeur absente
+  St.addSeries(s, 'melErr', null); St.addSeries(s, 'jnd', undefined); St.addDensity(s, 57, null);
+  ok(!(s.series.melErr || []).length && !(s.series.jnd || []).length && !Object.values(s.dens).flat().length, 'valeur absente enregistrée');
+  ok(D.median([null, 3, 5, null, 4]) === 4 && D.mean([null, 2, 4]) === 3, 'médiane/moyenne : null compté comme 0');
+});
+
 console.log('\n' + (count - fails) + '/' + count + ' tests réussis');
 process.exit(fails ? 1 : 0);
