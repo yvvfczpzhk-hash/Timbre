@@ -70,6 +70,27 @@ try { ({ chromium } = require('playwright')); } catch (e) {
       for (let k = 30; k < 5 * 100; k++) { const low = env[k] < mx * 1e-3; if (low && !inGap) gaps++; inGap = low; }
       if (gaps < 4) fail('attaques : ' + gaps + ' silences au lieu de 4');
     }
+    // 7) ondulation de démonstration (« Droit puis vibrato ») : droite au début, puis à la vitesse demandée
+    for (const rate of [3, 4, 5]) {
+      const st = C.EX.vibrato.steps({ note: 55, mode: 'onde', rate })[0];
+      const { pcm, sr } = await A.renderOffline(st.play, { timbre: 'voix', vowel: 'a' }, 16000);
+      const tr = D.trackPitch(pcm, {}), seq = (a, b) => { const v = []; for (let k = Math.round(a / tr.hop); k < Math.round(b / tr.hop) && k < tr.n; k++) v.push(tr.voiced[k] ? tr.midi[k] : NaN); return v; };
+      const flat = D.vibratoStats(seq(0.3, 1.9), tr.hop), wave = D.vibratoStats(seq(2.8, 5.3), tr.hop, 2.3);
+      if (flat.vibrato || flat.wobble > 8) fail('ondulation ' + rate + ' Hz : le début n’est pas droit (' + flat.wobble.toFixed(0) + ' c)');
+      if (!wave.vibrato || Math.abs(wave.rate - rate) > 0.3 || Math.abs(wave.extent - 45) > 12) fail('ondulation ' + rate + ' Hz : mesurée ' + wave.rate.toFixed(2) + ' Hz, ±' + wave.extent.toFixed(0) + ' c');
+    }
+    // 8) « La même, juste » : une prise rejouée avec correction arrive sur la note (tenue, puis note par note)
+    {
+      const low = await A.renderOffline({ kind: 'note', midi: 54.85, dur: 2.5 }, { timbre: 'voix', vowel: 'a' }, 48000);      // 15 cents trop bas
+      const fix = await A.renderOffline({ kind: 'pcm', pcm: low.pcm, sr: 48000, dur: low.pcm.length / 48000, shift: [{ a: 0, b: Infinity, cents: 15 }] }, {}, 48000);
+      const e = (pitchOf(fix.pcm, 48000, 0.4, 2.2) - 55) * 100;
+      if (!(Math.abs(e) < 3)) fail('tenue corrigée : ' + e.toFixed(1) + ' c');
+      const errs = [-20, 25, -12], notes = [50, 52, 55].map((m, i) => m + errs[i] / 100);
+      const mel = await A.renderOffline({ kind: 'seq', notes, tempo: 60 }, { timbre: 'voix', vowel: 'a' }, 48000);
+      const shift = errs.map((c, i) => ({ a: 0.03 + i, b: 1.03 + i, cents: -c }));
+      const out = await A.renderOffline({ kind: 'pcm', pcm: mel.pcm, sr: 48000, dur: mel.pcm.length / 48000, shift }, {}, 48000);
+      let t = 0.06; errs.forEach((c, i) => { const len = 1 / Math.pow(2, -c / 1200), p = (pitchOf(out.pcm, 48000, t + 0.25 * len, t + 0.8 * len) - [50, 52, 55][i]) * 100; if (!(Math.abs(p) < 4)) fail('note ' + (i + 1) + ' corrigée : ' + p.toFixed(1) + ' c'); t += len; });
+    }
     // 6) volume maximal : forte, mais sans saturer la sortie
     A.setUserVolume(2);
     const { pcm } = await A.renderOffline({ kind: 'seq', notes: [48, 52, 55, 60, 55, 52, 48], tempo: 100 }, { timbre: 'voix', vowel: 'a' }, 48000);
@@ -80,7 +101,7 @@ try { ({ chromium } = require('playwright')); } catch (e) {
   });
   for (const f of r.fails) console.log('✗ ' + f);
   if (errors.length) console.log('✗ erreurs JS : ' + errors.join(' | '));
-  console.log(r.fails.length || errors.length ? 'ÉCHEC' : '✓ modèles sonores : hauteur, timbre, glissés, attaques et volume conformes');
+  console.log(r.fails.length || errors.length ? 'ÉCHEC' : '✓ modèles sonores : hauteur, timbre, glissés, attaques, ondulation, prise corrigée et volume conformes');
   await browser.close();
   process.exit(r.fails.length || errors.length ? 1 : 0);
 })();
